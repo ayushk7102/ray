@@ -7,6 +7,12 @@ TRAVIS_COMMIT="${TRAVIS_COMMIT:-$BUILDKITE_COMMIT}"
 export RAY_BUILD_ENV="manylinux_py${PYTHON}"
 
 mkdir -p .whl
+
+# Restore Rust extension after git clean (built once before the loop)
+if [[ -f ".whl/ray_parquet_rs.so" ]]; then
+  cp .whl/ray_parquet_rs.so python/ray/ray_parquet_rs.so
+fi
+
 cd python
 /opt/python/"${PYTHON}"/bin/pip install -q cython==3.0.12 setuptools==80.9.0
 # Set the commit SHA in _version.py.

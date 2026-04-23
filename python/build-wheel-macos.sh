@@ -41,6 +41,14 @@ popd
 
 mkdir -p .whl
 
+# Build Rust parquet reader once (abi3 binary compatible with Python 3.10+)
+pip install maturin
+pushd rust/ray-parquet-reader
+  maturin build --release --out /tmp/ray-rust-ext
+popd
+unzip -o /tmp/ray-rust-ext/ray_parquet_rs-*.whl "ray_parquet_rs*.so" -d /tmp/rust-so
+cp /tmp/rust-so/ray_parquet_rs*.so .whl/ray_parquet_rs.so
+
 for ((i=0; i<${#PY_MMS[@]}; ++i)); do
   PY_MM=${PY_MMS[i]}
   CONDA_ENV_NAME="p$PY_MM"
@@ -49,6 +57,9 @@ for ((i=0; i<${#PY_MMS[@]}; ++i)); do
   # The -d flag removes directories. The -x flag ignores the .gitignore file,
   # and the -e flag ensures that we don't remove the .whl directory.
   git clean -f -f -x -d -e .whl -e $DOWNLOAD_DIR -e python/ray/dashboard/client -e dashboard/client
+
+  # Restore Rust extension (git clean removes untracked files)
+  cp .whl/ray_parquet_rs.so python/ray/ray_parquet_rs.so
 
   # Install python using conda. This should be easier to produce consistent results in buildkite and locally.
   [ ! -f "$HOME/.bash_profile" ] && conda init bash

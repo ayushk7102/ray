@@ -152,6 +152,11 @@ ray_files = [
 if sys.platform == "linux":
     ray_files.append("ray/core/libjemalloc.so")
 
+# Rust Parquet reader extension (built separately via maturin; optional)
+_rust_parquet_so = "ray/ray_parquet_rs" + pyd_suffix
+if os.path.exists(os.path.join(ROOT_DIR, _rust_parquet_so)):
+    ray_files.append(_rust_parquet_so)
+
 if BUILD_JAVA or os.path.exists(os.path.join(ROOT_DIR, "ray/jars/ray_dist.jar")):
     ray_files.append("ray/jars/ray_dist.jar")
 

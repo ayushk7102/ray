@@ -4,6 +4,7 @@ import copy
 import functools
 import logging
 import time
+import os
 from abc import ABC, abstractmethod
 from dataclasses import replace
 from typing import (
@@ -730,7 +731,8 @@ def _map_task(
         )
 
         blocks_iter = _iter_sliced_blocks(blocks, slices) if slices else iter(blocks)
-
+        import psutil
+        process = psutil.Process(os.getpid())
         # NOTE: We avoid the cost of deduping schemas in the task because
         # each yielded block should have the same schema, since each one
         # is a slice of the UDF's single output block, and we know that
@@ -739,16 +741,24 @@ def _map_task(
         yielded_schema: bool = False
 
         with MemoryProfiler(data_context.memory_usage_poll_interval_s) as profiler:
+            output_idx = 0
             for block in map_transformer.apply_transform(blocks_iter, ctx):
+                rss_before = process.memory_info().rss
                 block_meta = BlockAccessor.for_block(block).get_metadata()
                 block_schema = BlockAccessor.for_block(block).schema()
-
+                
                 # Finish processing before yielding the block!
                 blk_exec_stats_builder.finish()
 
                 # Yield block and retrieve its Ray object serialization timing
                 gen_stats: StreamingGeneratorStats = yield block
-
+                rss_after = process.memory_info().rss
+                logger.info(
+                    "Memory for output %d: %s->%s",
+                    output_idx,
+                    memory_string(rss_before),
+                    memory_string(rss_after),
+                )
                 exec_stats = blk_exec_stats_builder.build(
                     block_ser_time_s=(
                         gen_stats.object_creation_dur_s if gen_stats else None
@@ -778,7 +788,7 @@ def _map_task(
                 yielded_schema = True
                 blk_exec_stats_builder = BlockExecStats.builder()
                 profiler.reset()
-
+                output_idx += 1
 
 def _canonicalize_ray_remote_args(ray_remote_args: Dict[str, Any]) -> Dict[str, Any]:
     """Enforce rules on ray remote args for map tasks.

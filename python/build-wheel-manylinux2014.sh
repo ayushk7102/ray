@@ -41,6 +41,14 @@ PYTHON_VERSIONS=(
 # Compile ray
 ./ci/build/build-manylinux-ray.sh
 
+# Build Rust parquet reader once (abi3 binary compatible with Python 3.10+)
+pip install maturin
+pushd rust/ray-parquet-reader
+  maturin build --release --out /tmp/ray-rust-ext
+popd
+unzip -o /tmp/ray-rust-ext/ray_parquet_rs-*.whl "ray_parquet_rs*.so" -d /tmp/rust-so
+cp /tmp/rust-so/ray_parquet_rs*.so .whl/ray_parquet_rs.so
+
 # Build ray wheel
 for PYTHON_VERSIONS in "${PYTHON_VERSIONS[@]}" ; do
   PYTHON_VERSION_KEY="$(echo "${PYTHON_VERSIONS}" | cut -d' ' -f1)"

@@ -131,6 +131,17 @@ _ARROW_CHUNK_LIMIT = 2 * 1024**3  # 2GB
 
 _MIN_PYARROW_VERSION_FOR_SCANNER_DEFAULTS = parse_version("12.0.1")
 
+# Opt-in: route local parquet reads through the Rust reader
+# (``arrow-rs/ray-parquet-reader``, exposed as the ``ray_parquet_rs``
+# extension module) instead of PyArrow's scanner. The Rust path is
+# only taken when every precondition is met; unsupported cases (remote
+# filesystems, predicate pushdown, nested-type fallback, missing
+# extension module) fall back to PyArrow transparently.
+_USE_RUST_PARQUET_READER = env_bool("RAY_DATA_PARQUET_USE_RUST_READER", False)
+_RUST_PARQUET_READER_NUM_THREADS = env_integer(
+    "RAY_DATA_PARQUET_RUST_READER_NUM_THREADS", 4
+)
+
 
 class _ParquetFragment:
     """This wrapper class is created to avoid utilizing `ParquetFileFragment` original
@@ -1302,6 +1313,167 @@ def _resolve_read_columns(
     return columns
 
 
+def _fragment_is_on_local_fs(fragment: "ParquetFileFragment") -> bool:
+    """Return True when ``fragment`` is backed by the local filesystem.
+
+    ``ParquetDatasource`` wraps the resolved filesystem in
+    :class:`RetryingPyFileSystem` before handing it to ``pq.ParquetDataset``.
+    PyArrow can strip the subclass identity on round-trip, so
+    ``fragment.filesystem`` may come back as a plain
+    :class:`pyarrow.fs.PyFileSystem` wrapping the retry handler. We peel
+    both layers (``fs.unwrap()`` and ``fs.handler.unwrap()``) to reach the
+    real filesystem.
+    """
+    import pyarrow.fs as pa_fs
+
+    fs = fragment.filesystem
+    if fs is None:
+        return False
+
+    for _ in range(3):
+        unwrap = getattr(fs, "unwrap", None)
+        if callable(unwrap):
+            try:
+                fs = unwrap()
+                continue
+            except Exception:
+                pass
+        handler = getattr(fs, "handler", None)
+        if handler is not None:
+            handler_unwrap = getattr(handler, "unwrap", None)
+            if callable(handler_unwrap):
+                try:
+                    fs = handler_unwrap()
+                    continue
+                except Exception:
+                    pass
+        break
+
+    return isinstance(fs, pa_fs.LocalFileSystem)
+
+
+def _try_iter_batches_with_rust_reader(
+    fragment: "ParquetFileFragment",
+    *,
+    columns: Optional[List[str]],
+    schema: Optional["pyarrow.Schema"],
+    batch_size: Optional[int],
+    filter_expr: Optional["pyarrow.dataset.Expression"],
+) -> Optional[Iterable["pyarrow.RecordBatch"]]:
+    """Decode ``fragment`` with the Rust parquet reader when eligible.
+
+    Returns an iterator of :class:`pyarrow.RecordBatch` when the Rust path is
+    taken; ``None`` otherwise so the caller can use the PyArrow scanner.
+
+    Eligibility (all must hold):
+      * ``RAY_DATA_PARQUET_USE_RUST_READER`` env flag is truthy.
+      * No predicate pushdown — the Rust reader does not accept filters.
+      * Fragment is on a ``LocalFileSystem`` — the Rust reader opens paths
+        via ``std::fs::File``.
+      * The ``ray_parquet_rs`` extension module is importable.
+    """
+    if not _USE_RUST_PARQUET_READER:
+        return None
+    if filter_expr is not None:
+        if log_once("rust_parquet_reader_skip_filter"):
+            logger.warning(
+                "RAY_DATA_PARQUET_USE_RUST_READER is set but a filter was "
+                "pushed to the scanner; the Rust reader does not support "
+                "predicate pushdown, falling back to PyArrow's scanner."
+            )
+        return None
+    if not _fragment_is_on_local_fs(fragment):
+        if log_once("rust_parquet_reader_skip_remote"):
+            logger.warning(
+                "RAY_DATA_PARQUET_USE_RUST_READER is set but fragment %r is "
+                "not on a local filesystem (got %s); the Rust reader only "
+                "supports local paths, falling back to PyArrow's scanner.",
+                fragment.path,
+                type(fragment.filesystem).__name__,
+            )
+        return None
+
+    try:
+        from ray import ray_parquet_rs
+    except ImportError:
+        if log_once("rust_parquet_reader_import_failed"):
+            logger.warning(
+                "RAY_DATA_PARQUET_USE_RUST_READER is set but the "
+                "'ray_parquet_rs' extension module is not importable; "
+                "falling back to PyArrow's scanner."
+            )
+        return None
+
+    # Propagate the fragment's existing row-group subset (set when the
+    # ``ParquetDatasource`` has already pruned via metadata or filter
+    # pushdown). ``None`` means "all row groups".
+    row_groups = (
+        [rg.id for rg in fragment.row_groups]
+        if fragment.row_groups is not None
+        else None
+    )
+
+    kwargs: Dict[str, Any] = {"num_threads": _RUST_PARQUET_READER_NUM_THREADS}
+    if columns is not None:
+        kwargs["columns"] = list(columns)
+    if row_groups is not None:
+        kwargs["row_groups"] = list(row_groups)
+    if batch_size is not None and batch_size > 0:
+        kwargs["batch_size"] = int(batch_size)
+    logger.info(f"kwargs: {kwargs}")
+    if log_once("rust_parquet_reader_in_use"):
+        logger.warning(
+            "Using Rust parquet reader ('ray_parquet_rs') for local "
+            "parquet fragments (num_threads=%s). Set "
+            "RAY_DATA_PARQUET_USE_RUST_READER=0 to revert to PyArrow.",
+            _RUST_PARQUET_READER_NUM_THREADS,
+        )
+
+    reader = ray_parquet_rs.read_parquet_batches_stream(fragment.path, **kwargs)
+    return _rust_reader_batches(reader, target_schema=schema, columns=columns)
+
+
+def _rust_reader_batches(
+    reader: Iterable["pyarrow.RecordBatch"],
+    *,
+    target_schema: Optional["pyarrow.Schema"],
+    columns: Optional[List[str]],
+) -> Iterable["pyarrow.RecordBatch"]:
+    """Iterate batches from the Rust reader, aligning to ``target_schema``.
+
+    The Rust reader returns batches with the *physical* file schema; the
+    PyArrow path would otherwise unify against the dataset schema passed
+    through ``fragment.to_batches(schema=)``. We replicate that alignment
+    here when schemas differ so downstream post-processing and block
+    concatenation see the same shape regardless of reader.
+    """
+    import pyarrow as pa
+
+    align_schema: Optional["pyarrow.Schema"] = None
+    if target_schema is not None:
+        if columns is not None:
+            align_schema = pa.schema(
+                [
+                    target_schema.field(c)
+                    for c in columns
+                    if target_schema.get_field_index(c) != -1
+                ]
+            )
+        else:
+            align_schema = target_schema
+
+    for batch in reader:
+        if align_schema is not None and batch.schema != align_schema:
+            # ``pa.RecordBatch.cast`` exists only in newer PyArrow; going
+            # through a Table keeps this compatible with the project's
+            # minimum PyArrow version.
+            aligned_tbl = pa.Table.from_batches([batch]).cast(align_schema)
+            for aligned in aligned_tbl.to_batches():
+                yield aligned
+        else:
+            yield batch
+
+
 def _iter_batches_with_nested_fallback(
     fragment: "ParquetFileFragment",
     *,
@@ -1328,6 +1500,17 @@ def _iter_batches_with_nested_fallback(
     read_columns = _resolve_read_columns(columns, filter_expr, filter_columns)
 
     if not _needs_nested_type_fallback(fragment, read_columns):
+        rust_batches = _try_iter_batches_with_rust_reader(
+            fragment,
+            columns=columns,
+            schema=schema,
+            batch_size=to_batches_kwargs.get("batch_size"),
+            filter_expr=filter_expr,
+        )
+        if rust_batches is not None:
+            yield from rust_batches
+            return
+
         yield from fragment.to_batches(
             columns=columns,
             filter=filter_expr,
