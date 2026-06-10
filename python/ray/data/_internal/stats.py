@@ -43,8 +43,8 @@ from ray.data._internal.metadata_exporter import (
     get_dataset_metadata_exporter,
 )
 from ray.data._internal.stats_metrics_registry import (
-    OP_RUNTIME_NAMESPACE,
     GLOBAL_METRICS_REGISTRY,
+    OP_RUNTIME_NAMESPACE,
 )
 from ray.data._internal.util import capfirst
 from ray.data.block import BlockStats
