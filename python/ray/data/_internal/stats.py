@@ -43,7 +43,7 @@ from ray.data._internal.metadata_exporter import (
     get_dataset_metadata_exporter,
 )
 from ray.data._internal.stats_metrics_registry import (
-    _OP_RUNTIME_NAMESPACE,
+    OP_RUNTIME_NAMESPACE,
     GLOBAL_METRICS_REGISTRY,
 )
 from ray.data._internal.util import capfirst
@@ -403,8 +403,8 @@ class _StatsActor:
         # All operator-scoped metrics declared via the registry are created in
         # one pass, keyed by namespace -> {metric_name: Metric}
         self._prom_metrics: Dict[str, Dict[str, Metric]] = {
-            _OP_RUNTIME_NAMESPACE: self._create_prometheus_metrics(
-                _OP_RUNTIME_NAMESPACE, default_tag_keys=op_tags_keys
+            OP_RUNTIME_NAMESPACE: self._create_prometheus_metrics(
+                OP_RUNTIME_NAMESPACE, default_tag_keys=op_tags_keys
             )
         }
 
@@ -642,7 +642,7 @@ class _StatsActor:
             self.cpu_usage_cores.set(stats.get("cpu_usage", 0), tags)
             self.gpu_usage_cores.set(stats.get("gpu_usage", 0), tags)
             for field_name, prom_metric in self._prom_metrics[
-                _OP_RUNTIME_NAMESPACE
+                OP_RUNTIME_NAMESPACE
             ].items():
                 _record(prom_metric, stats.get(field_name, 0), tags)
 
