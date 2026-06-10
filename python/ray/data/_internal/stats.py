@@ -557,15 +557,16 @@ class _StatsActor:
     ) -> Dict[str, Metric]:
         """Build the Prometheus primitives for one registry namespace.
 
-        Returns a ``{metric_name: Metric}`` dict with one Gauge/Counter/Histogram
-        per registered metric definition (``Unsupported`` types are skipped). The dict
-        key is the metric's ``name``, and the value is the Prometheus primitive.
-
         Args:
             namespace: Registry namespace to build primitives for (e.g.
                 ``"op_runtime"``).
             default_tag_keys: Prometheus label keys applied to any definition
                 that does not declare its own ``tag_keys``.
+
+        Returns:
+            A ``{metric_name: Metric}`` dict with one Gauge/Counter/Histogram per
+            registered metric definition (``Unsupported`` types are skipped). The
+            dict key is the metric's ``name``, the value the Prometheus primitive.
         """
         metrics = {}
         for metric in GLOBAL_METRICS_REGISTRY.definitions(namespace):
