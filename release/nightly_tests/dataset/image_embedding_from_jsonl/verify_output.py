@@ -79,9 +79,11 @@ def expected_rows_per_file(sizes: Dict[str, int], width: int) -> Dict[str, int]:
 
 
 def actual_rows_per_file(sink: str) -> Counter:
-    dataset = ds.dataset(
-        _strip_scheme(sink), format="parquet", filesystem=pafs.S3FileSystem()
-    )
+    # Full URI, no explicit filesystem: pyarrow infers it from the scheme and picks
+    # up credentials from the standard AWS chain, the same way the uris verifier
+    # does. A bare `S3FileSystem()` would drop the region and is not how any other
+    # release script reaches S3.
+    dataset = ds.dataset(sink, format="parquet")
     counts = Counter()
     for batch in dataset.to_batches(columns=[KEY_COLUMN]):
         for value in batch.column(KEY_COLUMN).to_pylist():
