@@ -87,6 +87,15 @@ def parse_args():
             "for the time GPU based Infer takes to process one batch"
         ),
     )
+    parser.add_argument(
+        "--verify-output",
+        action="store_true",
+        help=(
+            "Read with include_paths and check per-file row conservation against the "
+            "source corpus after the write (see verify_output.py), failing the run on "
+            "a mismatch. Off by default so the stock benchmark path is unchanged."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -99,14 +108,19 @@ def decode(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     image_data = b64decode(row["image"], None, True)
     image = Image.open(BytesIO(image_data))
     width, height = image.size
-    return [
-        {
-            "original_url": row["url"],
-            "original_width": width,
-            "original_height": height,
-            "image": np.asarray(image),
-        }
-    ]
+    decoded = {
+        "original_url": row["url"],
+        "original_width": width,
+        "original_height": height,
+        "image": np.asarray(image),
+    }
+    # Presence-driven: the read only supplies `path` under --verify-output, so no
+    # flag has to be propagated to the workers. This is the only per-row identity
+    # available -- the corpus is one image and one url replicated, so `original_url`
+    # is not a key and no per-row id can be injected.
+    if "path" in row:
+        decoded["source_file"] = row["path"]
+    return [decoded]
 
 
 def preprocess(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -184,6 +198,8 @@ class Infer:
                         "original_height": batch["original_height"],
                         "output": output.cpu().numpy(),
                     }
+                    if "source_file" in batch:
+                        result["source_file"] = batch["source_file"]
         else:
             next_tensor = torch.from_numpy(batch["image"]).to(
                 dtype=torch.float32, device=self._device, non_blocking=True
@@ -196,6 +212,8 @@ class Infer:
                 "original_height": batch["original_height"],
                 "output": output.cpu().numpy(),
             }
+            if "source_file" in batch:
+                result["source_file"] = batch["source_file"]
 
         return result
 
@@ -209,13 +227,16 @@ class FakeInfer:
         n = len(batch["original_url"])
         # Emulate the GPU forward pass: sleep for the batch's inference time.
         time.sleep(GPU_SECONDS_PER_IMAGE * n)
-        return {
+        result = {
             "original_url": batch["original_url"],
             "original_width": batch["original_width"],
             "original_height": batch["original_height"],
             # Real Infer returns model(...).logits, shape (n, 1000) float32.
             "output": np.zeros((n, 1000), dtype=np.float32),
         }
+        if "source_file" in batch:
+            result["source_file"] = batch["source_file"]
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +272,15 @@ def main(args: argparse.Namespace, profiling: Profiling):
 
     num_gpus = max(args.inference_concurrency)
     ds_holder = {}
+    # `source_file` is the only identity this corpus admits, and it costs a column
+    # on every row, so it is only requested when the output is going to be checked.
+    read_kwargs = {"include_paths": True} if args.verify_output else {}
 
     def benchmark_fn():
         ds = (
-            ray.data.read_json(INPUT_PREFIX, lines=True, memory=READ_MEMORY)
+            ray.data.read_json(
+                INPUT_PREFIX, lines=True, memory=READ_MEMORY, **read_kwargs
+            )
             .flat_map(decode)
             .map(preprocess)
             .map_batches(
@@ -285,6 +311,17 @@ def main(args: argparse.Namespace, profiling: Profiling):
     benchmark.result["main"].update(metrics)
 
     benchmark.write_result()
+
+    if args.verify_output:
+        # Verified with pyarrow rather than Ray Data: checking Ray Data's output
+        # with Ray Data would let a bug cancel itself out.
+        from verify_output import verify
+
+        print(f"Verifying sink {OUTPUT_PREFIX}")
+        if verify(OUTPUT_PREFIX) != 0:
+            raise RuntimeError(
+                f"Output verification failed for {OUTPUT_PREFIX}; see the checks above."
+            )
 
     # Copy result.json to shared storage for telemetry upload.
     import shutil

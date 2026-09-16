@@ -1522,6 +1522,54 @@
       python image_classification_from_parquet/main.py
       --data-directory 300G-image-data-synthetic-raw-parquet --data-format parquet
 
+# Chaos A/B for object-loss recovery, with output correctness checked rather than
+# just liveness. Split out of the matrix above (like iceberg_benchmark_overwrite) so
+# the stock cases stay byte-identical and only this one carries the recovery env.
+#
+# The seed here is `from_pandas`, so read output is 1-block-in-1-block-out; the
+# `(row_serial, patch_x, patch_y)` key is analytic (69,000 images x 36 patches =
+# 2,484,000 rows), which is what makes `--verify-output` a real check: it catches a
+# dropped row, a duplicated row, and a recovered block carrying the wrong rows.
+- name: image_embedding_from_uris_fixed_size_chaos_{{recovery_mode}}
+  python: "3.10"
+  group: data-lineage-recovery
+
+  matrix:
+    setup:
+      recovery_mode: []
+      data_recovery: []
+      core_pinning: []
+    adjustments:
+      - with:
+          recovery_mode: data
+          data_recovery: 1
+          core_pinning: 0
+      - with:
+          recovery_mode: core
+          data_recovery: 0
+          core_pinning: 1
+
+  cluster:
+    anyscale_sdk_2026: true
+    cluster_compute: image_embedding_from_uris/fixed_size_cluster_compute.yaml
+    byod:
+      runtime_env:
+        # Declaring a ``runtime_env`` REPLACES the DEFAULTS list rather than
+        # extending it, so the standard guards are re-listed here.
+        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
+        - RAYTEST_FAIL_ON_WORKER_OOM=1
+        # Chaos terminates nodes on purpose, and the backlog it creates spills.
+        - RAYTEST_FAIL_ON_DEAD_NODES=0
+        - RAYTEST_FAIL_ON_SPILLING=0
+        - RAY_DATA_ENABLE_SEED_INPUT_LINEAGE_RECOVERY={{data_recovery}}
+        - RAY_lineage_pinning_enabled={{core_pinning}}
+
+  run:
+    timeout: 3600
+    script: >
+      python image_embedding_from_uris/main.py
+      --inference-concurrency 100 100 --chaos --verify-output
+
 - name: image_embedding_from_uris_{{case}}
   python: "3.10"
   frequency: weekly
@@ -1555,6 +1603,60 @@
     timeout: 3600
     script: python image_embedding_from_uris/main.py {{args}}
 
+
+# Chaos A/B with output correctness, on the one workload whose seed is `read_json`
+# -- the only one of these where output blocks are cut by accumulated size rather
+# than by a structure in the input, so it is the case that actually exercises
+# reconstruction's positional block identity.
+#
+# Correctness here is per-file, not per-row: the corpus is one image and one url
+# replicated, so `original_url` is not a key. `--verify-output` reads with
+# include_paths and checks per-file row conservation, which still catches a loss in
+# one file masked by a duplicate in another.
+#
+# NOTE: this compute is 100 x r6a.8xlarge + 40 x g5.4xlarge = 140 nodes, which has
+# repeatedly failed to provision via CI (OUT_OF_RETRIES). Kept `frequency: manual`
+# accordingly; the workspace path is the reliable way to run it.
+- name: image_embedding_from_jsonl_fixed_size_chaos_{{recovery_mode}}
+  python: "3.10"
+  group: data-lineage-recovery
+  frequency: manual
+
+  matrix:
+    setup:
+      recovery_mode: []
+      data_recovery: []
+      core_pinning: []
+    adjustments:
+      - with:
+          recovery_mode: data
+          data_recovery: 1
+          core_pinning: 0
+      - with:
+          recovery_mode: core
+          data_recovery: 0
+          core_pinning: 1
+
+  cluster:
+    anyscale_sdk_2026: true
+    cluster_compute: image_embedding_from_jsonl/fixed_size_cluster_compute.yaml
+    byod:
+      runtime_env:
+        # Declaring a ``runtime_env`` REPLACES the DEFAULTS list rather than
+        # extending it, so the standard guards are re-listed here.
+        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
+        - RAYTEST_FAIL_ON_WORKER_OOM=1
+        # Chaos terminates nodes on purpose, and the backlog it creates spills.
+        - RAYTEST_FAIL_ON_DEAD_NODES=0
+        - RAYTEST_FAIL_ON_SPILLING=0
+        - RAY_DATA_ENABLE_SEED_INPUT_LINEAGE_RECOVERY={{data_recovery}}
+        - RAY_lineage_pinning_enabled={{core_pinning}}
+
+  run:
+    timeout: 3600
+    script: >
+      python image_embedding_from_jsonl/main.py
+      --inference-concurrency 40 40 --chaos --verify-output
 
 - name: image_embedding_from_jsonl_{{case}}
   python: "3.10"
