@@ -15,10 +15,12 @@ from typing import (
     Deque,
     Dict,
     Final,
+    FrozenSet,
     Iterable,
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -287,14 +289,21 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         # recovery is enabled and this op reads straight from an `InputDataBuffer`
         # (see `_anchors_seed_input`).
         self._seed_task_inputs: Dict[str, RefBundle] = {}
-        # block hex -> queue of (seed task id, plan id) for a seed input queued for
+        # block hex -> queue of (seed task id, plan ids) for a seed input queued for
         # re-injection. A seed's input comes from the source, not from a task, so no
         # producer recorded it and `_lineage_for_submission` cannot look it up.
         # `_recover_lost_object` stamps the identity here; submission pops it.
         #
-        # A queue, not a single value: a second plan tracing back to the same seed
-        # re-injects the same bundle behind the one already queued.
-        self._pending_seed_ids: Dict[str, Deque[Tuple[str, str]]] = {}
+        # The plan ids are one set object shared by every block hex of the bundle. A
+        # plan that traces back to this seed while the entry is still queued joins it
+        # (`join_pending_seed_reinjection`) instead of re-injecting.
+        #
+        # A queue, not a single value, because a join is refused when two plans need
+        # the same child of the seed; the refused plan then re-injects the same bundle
+        # behind the queued one. We need to keep track of the queued
+        self._pending_seed_ids: Dict[str, Deque[Tuple[str, Set[str]]]] = {}
+        # Plans that joined a queued re-injection: seed re-executions not run.
+        self._num_seed_reinjections_joined = 0
         # block hex -> (child task id, plan id) for an input set owed to a
         # reconstruction child. The producer's plan bucket records this, but
         # `register_task_complete` discharges it in the producer's done callback,
@@ -707,37 +716,103 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         return self._seed_task_inputs.get(seed_task_id)
 
     def stamp_seed_reinjection(
-        self, seed_task_id: str, plan_id: str, seed_input: RefBundle
+        self, seed_task_id: str, plan_ids: Iterable[str], seed_input: RefBundle
     ) -> None:
-        """Carry a re-injected seed's identity across to its resubmission.
+        """Stamp a re-injected seed input with the identity its submission must use.
 
-        A seed's input comes from the source rather than from a task, so no producer
-        recorded it and `_lineage_for_submission` cannot look it up. Without this the
-        re-injected bundle is minted a fresh id and the plan never resolves.
-
-        Every block of the bundle is stamped, so a bundler merge cannot hide the one
-        that gets looked at.
+        A seed's input comes from the source, not from a task, so nothing recorded a
+        producer for it and ``_lineage_for_submission`` cannot look it up. Every block
+        of the bundle is stamped so a bundler merge cannot hide the one examined.
+        Entries accumulate: a refused join re-injects the same bundle behind the
+        queued one. ``plan_ids`` is one set object shared across the bundle's blocks,
+        so a later join extends it in one place.
         """
+        assert not isinstance(plan_ids, str), "plan_ids is a collection of plan ids"
+        plans = set(plan_ids)
         for block_ref in seed_input.block_refs:
             self._pending_seed_ids.setdefault(block_ref.hex(), deque()).append(
-                (seed_task_id, plan_id)
+                (seed_task_id, plans)
             )
+
+    def join_pending_seed_reinjection(
+        self, seed_task_id: str, plan_ids: Iterable[str], seed_input: RefBundle
+    ) -> bool:
+        """Attach plans to an already queued re-injection of this seed task.
+
+        While a re-injection is still queued nothing has run, so the one re-execution
+        can serve another plan too: the outputs that plan needs are classified
+        ``OBJECT_REUSED`` under it as they are produced. This check and the stamp's
+        consumption both run on the executor thread, so a stamp still present means
+        the re-execution has not started.
+
+        Refused when the new plans and the queued ones share a pending child of the
+        seed: a shared re-run releases a child once per plan, and two releases carry
+        the same blocks, so the second would overwrite the first's stamp on the
+        consumer. The refused plan re-injects on its own.
+
+        Returns:
+            True if the queued re-injection now carries the plans; False if the
+            caller must re-inject.
+        """
+        assert not isinstance(plan_ids, str), "plan_ids is a collection of plan ids"
+        if self._lineage_tracker is None or not seed_input.block_refs:
+            return False
+        queued = self._pending_seed_ids.get(seed_input.block_refs[0].hex())
+        if not queued:
+            return False
+        # Newest entry: furthest from dispatch. A block belongs to one seed's bundle,
+        # so its entries are this seed's.
+        queued_seed_id, queued_plans = queued[-1]
+        assert queued_seed_id == seed_task_id, (queued_seed_id, seed_task_id)
+
+        new_plans = set(plan_ids) - queued_plans
+        if not new_plans:
+            return True
+
+        def pending_children_under(plans: Iterable[str]) -> Set[str]:
+            return {
+                child_task_id
+                for plan_id in plans
+                for child_task_id in self._lineage_tracker.get_pending_children(
+                    seed_task_id, plan_id
+                )
+            }
+
+        overlap = pending_children_under(new_plans) & pending_children_under(
+            queued_plans
+        )
+        if overlap:
+            logger.info(
+                "[lineage-recovery] Plan(s) %s cannot join the queued re-execution "
+                "of seed task %s under plan(s) %s: both need child task(s) %s. "
+                "Re-injecting separately.",
+                ", ".join(sorted(new_plans)),
+                seed_task_id,
+                ", ".join(sorted(queued_plans)),
+                ", ".join(sorted(overlap)),
+            )
+            return False
+
+        queued_plans.update(new_plans)
+        self._num_seed_reinjections_joined += len(new_plans)
+        return True
 
     def _lineage_for_submission(
         self, task_index: int, inputs: RefBundle
-    ) -> Tuple[Optional[str], Optional[str], List[ParentBlockOutput]]:
+    ) -> Tuple[Optional[str], FrozenSet[str], List[ParentBlockOutput]]:
         """Work out what this attempt should register with the lineage graph.
 
-        Returns ``(data_task_id, plan_id, dependencies)``, where ``plan_id`` is the
-        plan this attempt serves -- ``None`` for a fresh attempt -- or
-        ``(None, None, [])`` when object-loss recovery is off for this DAG.
+        Returns ``(data_task_id, plan_ids, dependencies)``, where ``plan_ids`` are
+        the plans this attempt serves -- empty for a fresh attempt -- or
+        ``(None, frozenset(), [])`` when object-loss recovery is off for this DAG.
 
         A fresh attempt is named ``f"{self.id}:{task_index}"``. A *reconstruction*
         must re-use the original logical id instead, or the plan never resolves and
-        the graph grows a duplicate node.
+        the graph grows a duplicate node. A reconstruction child serves one plan; a
+        re-injected seed serves every plan that joined its stamp.
         """
         if self._lineage_tracker is None:
-            return None, None, []
+            return None, frozenset(), []
 
         # A re-injected seed is the one identity that cannot be looked up: its input
         # came from the source rather than from a task, so no producer ever recorded
@@ -760,8 +835,8 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 if seed is None:
                     seed = claimed
         if seed is not None:
-            seed_id, plan_id = seed
-            return seed_id, plan_id, []
+            seed_id, plan_ids = seed
+            return seed_id, frozenset(plan_ids), []
 
         # One lookup, two uses. Passing every ref rather than just ``block_refs[0]``
         # matters: `RebundleQueue` parks zero-row bundles and prepends them on the
@@ -782,9 +857,9 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
 
         if reconstruction is not None:
             data_task_id, plan_id = reconstruction
-            return data_task_id, plan_id, dependencies
+            return data_task_id, frozenset({plan_id}), dependencies
 
-        return self._data_task_id_for(task_index), None, dependencies
+        return self._data_task_id_for(task_index), frozenset(), dependencies
 
     def _release_reconstruction_children(
         self, data_task_id: str, plan_id: str, task_index: int
@@ -895,14 +970,20 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._next_data_task_idx += 1
 
         # Resolve this attempt's lineage identity up front so the callbacks below
-        # can close over it. (None, None, []) when recovery is disabled.
-        data_task_id, plan_id, dependencies = self._lineage_for_submission(
+        # can close over it. (None, frozenset(), []) when recovery is disabled; plans
+        # are walked in sorted order so per-plan bookkeeping is deterministic.
+        data_task_id, plan_ids, dependencies = self._lineage_for_submission(
             task_index, inputs
         )
+        sorted_plan_ids = sorted(plan_ids)
         if data_task_id is not None:
-            self._lineage_tracker.register_task_submission(
-                data_task_id, dependencies, plan_id
-            )
+            # One call per plan this attempt serves. Only a re-injected seed serves
+            # more than one, and a seed has no tracked dependencies, so the repeated
+            # calls cannot double-discharge a parent's claim on a block.
+            for plan_id in sorted_plan_ids or [None]:
+                self._lineage_tracker.register_task_submission(
+                    data_task_id, dependencies, plan_id
+                )
             if self._anchors_seed_input():
                 # A seed consumes straight from an `InputDataBuffer`, so its input is
                 # durable and resubmittable. `register_task_failed` hands back seed
@@ -930,24 +1011,38 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 self._lineage_tracker.register_output(
                     data_task_id, output.block_refs[0].hex(), output_index
                 )
-                if plan_id is not None:
-                    status = self._lineage_tracker.get_object_reuse_status(
-                        data_task_id, output_index, plan_id
-                    )
-                    # REUSED: withhold until the child's whole input set is
-                    # re-produced, then release it as one bundle
+                if sorted_plan_ids:
+                    # One verdict per plan this re-execution serves. Verdicts cannot
+                    # conflict: NEW means no child ever consumed this output, REUSED
+                    # means one did.
+                    statuses = {
+                        plan_id: self._lineage_tracker.get_object_reuse_status(
+                            data_task_id, output_index, plan_id
+                        )
+                        for plan_id in sorted_plan_ids
+                    }
+                    # REUSED: withhold under that plan until the child's whole input
+                    # set is re-produced, then release it as one bundle
                     # (`_release_reconstruction_children`). Emitting now would run the
-                    # child against part of its input.
-                    if status is ObjectReuseStatus.OBJECT_REUSED:
-                        self._reconstruction_outputs.setdefault(plan_id, {})[
-                            (data_task_id, output_index)
-                        ] = output
+                    # child against part of its input. Plans sharing a re-execution
+                    # have disjoint children, so at most one plan says REUSED.
+                    withheld = False
+                    for plan_id, status in statuses.items():
+                        if status is ObjectReuseStatus.OBJECT_REUSED:
+                            self._reconstruction_outputs.setdefault(plan_id, {})[
+                                (data_task_id, output_index)
+                            ] = output
+                            withheld = True
+                    if withheld:
                         return
                     # PRUNED (a copy of the rows outlives the loss) or UNRELATED (the
                     # plan already finished with this task): no consumer is waiting,
                     # so drop it rather than re-emit rows the consumer already has.
                     # NEW falls through to the output queue.
-                    if status is not ObjectReuseStatus.OBJECT_NEW:
+                    if not any(
+                        status is ObjectReuseStatus.OBJECT_NEW
+                        for status in statuses.values()
+                    ):
                         return
 
             # Notify output queue that the task has produced an new output.
@@ -984,11 +1079,12 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             if data_task_id is not None and exception is None:
                 # Hand any child whose whole input set this completion completes
                 # downstream before reporting the completion itself.
-                if plan_id is not None:
+                for plan_id in sorted_plan_ids:
                     self._release_reconstruction_children(
                         data_task_id, plan_id, task_index
                     )
-                self._lineage_tracker.register_task_complete(data_task_id, plan_id)
+                for plan_id in sorted_plan_ids or [None]:
+                    self._lineage_tracker.register_task_complete(data_task_id, plan_id)
 
             self._data_tasks.pop(task_index)
             # Notify output queue that this task is complete.
@@ -1007,7 +1103,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             task_done_callback=functools.partial(_task_done_callback, task_index),
             operator_name=self.name,
             data_task_id=data_task_id,
-            plan_id=plan_id,
+            plan_ids=plan_ids,
         )
         self._metrics.on_task_submitted(
             task_index, inputs, task_id=data_task.get_task_id()

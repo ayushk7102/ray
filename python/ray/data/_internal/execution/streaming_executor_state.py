@@ -701,13 +701,19 @@ def _recover_lost_object(
         )
         return False
 
-    # A reconstruction that re-fails stays in the plan it serves; a fresh failure
-    # opens its own. Plans keep separate buckets on shared ancestors, so concurrent
-    # plans do not interfere.
+    # A reconstruction that re-fails stays in the plan(s) it serves; a fresh failure
+    # opens its own plan. Plans keep separate buckets on shared ancestors, so they
+    # do not interfere. A re-injected seed may serve several plans, so its failure
+    # is registered under each and its seeds re-injected once, under all of them.
+    traced_seed_ids: Set[str] = set()
+    plan_ids: Set[str] = set()
     try:
-        traced_seed_ids, plan_id = lineage_tracker.register_task_failed(
-            task.data_task_id, task.plan_id
-        )
+        for failed_plan_id in sorted(task.plan_ids) or [None]:
+            seed_ids_for_plan, plan_id = lineage_tracker.register_task_failed(
+                task.data_task_id, failed_plan_id
+            )
+            traced_seed_ids.update(seed_ids_for_plan)
+            plan_ids.add(plan_id)
     except ValueError:
         logger.info(
             "[lineage-recovery] Lost object for task %s on operator %r is not "
@@ -718,13 +724,14 @@ def _recover_lost_object(
         return False
 
     seed_task_ids = sorted(traced_seed_ids)
+    plans_str = ", ".join(sorted(plan_ids))
 
     if not seed_task_ids:
         logger.info(
             "[lineage-recovery] Reconstruction of %s is already under way "
-            "(plan %s); nothing further to resubmit.",
+            "(plan(s) %s); nothing further to resubmit.",
             task.data_task_id,
-            plan_id,
+            plans_str,
         )
         return False
 
@@ -761,6 +768,17 @@ def _recover_lost_object(
         # Completion latches are one-way and a finished op is filtered out of
         # dispatch, so the chain has to be reopened before anything can flow.
         _reopen_chain_for_recovery(topology, seed_op)
+        # A re-injection of this seed still queued by an earlier plan can serve these
+        # plans too, so one re-execution replaces one per lost object.
+        if seed_op.join_pending_seed_reinjection(seed_id, plan_ids, seed_input):
+            logger.info(
+                "[lineage-recovery] Plan(s) %s joined the queued re-execution of "
+                "seed task %s on operator %r; no additional seed task submitted.",
+                plans_str,
+                seed_id,
+                seed_op.name,
+            )
+            continue
         # `OpState.output_queue` of the source *is* the seed op's `input_queues[0]`
         # (same object, wired in `build_streaming_topology`), and `add_output`
         # maintains the external queue counters that a bare append would leave
@@ -768,23 +786,23 @@ def _recover_lost_object(
         # clears `get_eligible_operators`' backpressure gates like any other input.
         # Carry the seed's identity across to its resubmission; without it the
         # re-injected bundle is minted a fresh id and the plan never resolves.
-        seed_op.stamp_seed_reinjection(seed_id, plan_id, seed_input)
+        seed_op.stamp_seed_reinjection(seed_id, plan_ids, seed_input)
         source_op = seed_op.input_dependencies[0]
         topology[source_op].add_output(seed_input)
         logger.info(
             "[lineage-recovery] Re-injected seed task %s on operator %r "
-            "(~%s bytes) for plan %s.",
+            "(~%s bytes) for plan(s) %s.",
             seed_id,
             seed_op.name,
             seed_input.size_bytes(),
-            plan_id,
+            plans_str,
         )
 
     logger.warning(
-        "Recovering lost object for task %s: reconstructing via plan %s from "
+        "Recovering lost object for task %s: reconstructing via plan(s) %s from "
         "seed task(s) %s.",
         task.data_task_id,
-        plan_id,
+        plans_str,
         ", ".join(seed_task_ids),
     )
     return True

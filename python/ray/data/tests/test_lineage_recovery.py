@@ -697,7 +697,7 @@ def test_release_hands_over_the_whole_input_set_once(
     }
     assert consumer._lineage_for_submission(0, handed_over)[:2] == (
         child_task_id,
-        plan_id,
+        frozenset({plan_id}),
     )
 
 
@@ -959,6 +959,284 @@ def test_abort_after_normal_completion_is_a_noop():
     task.mark_aborted(ObjectLostError(ray.ObjectRef.nil().hex(), None, "late loss"))
 
     assert calls == [None], "the abort resurrected a completed task's callback"
+
+
+def test_second_plan_joins_the_queued_seed_reinjection(
+    ray_start_regular_shared,
+):  # noqa: F405
+    """A plan tracing back to a seed whose re-injection is still queued joins it.
+
+    A node death loses many descendants of one seed, and every one of them used to
+    re-inject that seed: N lost objects, N re-runs, each keeping one output and
+    pruning the rest. While the first re-injection is still queued nothing has run,
+    so the second plan attaches to it instead. Asserted through the real
+    ``_lineage_for_submission``, which must then hand the one re-execution both plans
+    and leave nothing behind to misidentify a later ordinary task.
+    """
+    from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+    from ray.data._internal.execution.util import make_ref_bundles
+
+    ctx = DataContext.get_current()
+    seed_input = make_ref_bundles([[1, 2, 3]])[0]
+    op = MapOperator.create(
+        create_map_transformer_from_block_fn(lambda block, _: block),
+        input_op=InputDataBuffer(ctx, [seed_input]),
+        data_context=ctx,
+        name="SeedAnchor",
+    )
+    op._lineage_tracker = LineageTracker()
+    op._lineage_tracker.register_task_submission("seed:0", [])
+
+    # Nothing is queued yet, so the first plan has to re-inject.
+    assert not op.join_pending_seed_reinjection("seed:0", {"plan_a"}, seed_input)
+    op.stamp_seed_reinjection("seed:0", {"plan_a"}, seed_input)
+    # The second finds that re-injection still queued and rides along.
+    assert op.join_pending_seed_reinjection("seed:0", {"plan_b"}, seed_input)
+    assert op._num_seed_reinjections_joined == 1
+
+    data_task_id, plan_ids, _ = op._lineage_for_submission(0, seed_input)
+    assert (data_task_id, plan_ids) == ("seed:0", frozenset({"plan_a", "plan_b"}))
+    # The one stamp is consumed; nothing is left to misidentify a later ordinary task.
+    assert op._pending_seed_ids == {}
+    assert op._lineage_for_submission(1, seed_input)[1] == frozenset()
+
+
+def test_plans_sharing_a_pending_child_do_not_join(
+    ray_start_regular_shared,
+):  # noqa: F405
+    """Two plans that both need the same child of the seed re-inject separately.
+
+    A shared re-run releases each child once per plan it is pending under, and two
+    releases of one child carry the same re-produced blocks: the second overwrites
+    the first's identity stamp on the consumer, and the unmarked bundle would run as
+    fresh, unpruned work. So a join is refused when children overlap, and the two
+    stamps then pair with two submissions exactly as before, neither clobbering the
+    other.
+    """
+    from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+    from ray.data._internal.execution.util import make_ref_bundles
+
+    ctx = DataContext.get_current()
+    seed_input = make_ref_bundles([[1, 2, 3]])[0]
+    op = MapOperator.create(
+        create_map_transformer_from_block_fn(lambda block, _: block),
+        input_op=InputDataBuffer(ctx, [seed_input]),
+        data_context=ctx,
+        name="SeedAnchor",
+    )
+    tracker = LineageTracker()
+    op._lineage_tracker = tracker
+
+    # seed:0 -> map:0 -> {reduce:0, reduce:1}. Losing either reduce task needs map:0
+    # re-run, so both plans list map:0 as the seed's pending child.
+    tracker.register_task_submission("seed:0", [])
+    tracker.register_output("seed:0", "block_a", 0)
+    tracker.register_task_submission("map:0", tracker.resolve_dependencies(["block_a"]))
+    tracker.register_output("map:0", "block_m0", 0)
+    tracker.register_output("map:0", "block_m1", 1)
+    tracker.register_task_submission(
+        "reduce:0", tracker.resolve_dependencies(["block_m0"])
+    )
+    tracker.register_task_submission(
+        "reduce:1", tracker.resolve_dependencies(["block_m1"])
+    )
+    seeds, plan_a = tracker.register_task_failed("reduce:0")
+    assert seeds == ["seed:0"]
+    seeds, plan_b = tracker.register_task_failed("reduce:1")
+    assert seeds == ["seed:0"]
+
+    op.stamp_seed_reinjection("seed:0", {plan_a}, seed_input)
+    assert not op.join_pending_seed_reinjection("seed:0", {plan_b}, seed_input)
+    assert op._num_seed_reinjections_joined == 0
+    op.stamp_seed_reinjection("seed:0", {plan_b}, seed_input)
+
+    first = op._lineage_for_submission(0, seed_input)
+    second = op._lineage_for_submission(1, seed_input)
+    assert first[:2] == ("seed:0", frozenset({plan_a}))
+    assert second[:2] == ("seed:0", frozenset({plan_b})), (
+        "the second re-injection lost its plan; under the clobbering version it was "
+        f"minted a fresh id instead: {second[:2]}"
+    )
+    assert op._pending_seed_ids == {}
+
+
+def test_shared_seed_re_execution_serves_every_joined_plan(
+    ray_start_regular_shared,  # noqa: F405
+):
+    """One re-execution of a seed, classified and discharged under two plans.
+
+    Two children fanned out from one seed are lost while the seed's re-injection is
+    still queued, so the second plan joins it. The single re-run must then withhold
+    each re-produced output under the plan whose child needs it, release each child
+    once under its own plan, and discharge both plans on the seed: everything two
+    separate re-runs would have done, minus one re-run.
+    """
+    from ray.data._internal.execution.interfaces.physical_operator import (
+        TaskExecDriverStats,
+    )
+    from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+    from ray.data._internal.execution.util import make_ref_bundles
+
+    ctx = DataContext.get_current()
+    seed_input = make_ref_bundles([[0]])[0]
+    producer = MapOperator.create(
+        create_map_transformer_from_block_fn(lambda block, _: block),
+        input_op=InputDataBuffer(ctx, [seed_input]),
+        data_context=ctx,
+        name="Seed",
+    )
+    consumer = MapOperator.create(
+        create_map_transformer_from_block_fn(lambda block, _: block),
+        input_op=producer,
+        data_context=ctx,
+        name="Consumer",
+    )
+    tracker = LineageTracker()
+    producer._lineage_tracker = tracker
+    consumer._lineage_tracker = tracker
+
+    # First run: the seed fans two blocks out to two children, then completes.
+    seed_id = f"{producer.id}:0"
+    child_ids = [f"{consumer.id}:{index}" for index in range(2)]
+    first_run = make_ref_bundles([[1], [2]])
+    tracker.register_task_submission(seed_id, [])
+    for index, (child_id, bundle) in enumerate(zip(child_ids, first_run)):
+        tracker.register_output(seed_id, bundle.block_refs[0].hex(), index)
+        tracker.register_task_submission(
+            child_id, tracker.resolve_dependencies([bundle.block_refs[0].hex()])
+        )
+    tracker.register_task_complete(seed_id)
+
+    # Both children are lost. The first plan re-injects the seed; the second finds
+    # that re-injection still queued and joins it.
+    plans = [tracker.register_task_failed(child_id)[1] for child_id in child_ids]
+    producer.stamp_seed_reinjection(seed_id, {plans[0]}, seed_input)
+    assert producer.join_pending_seed_reinjection(seed_id, {plans[1]}, seed_input)
+
+    # The one re-execution is submitted under both plans.
+    producer.start(ExecutionOptions(), noop_counter())  # noqa: F405
+    producer._submit_data_task(MagicMock(), seed_input)
+    (task,) = producer._data_tasks.values()
+    assert task.data_task_id == seed_id
+    assert task.plan_ids == frozenset(plans)
+    assert producer._pending_seed_ids == {}
+
+    # Each re-produced output is withheld under exactly the plan whose child needs
+    # it; nothing reaches the output queue on its own.
+    second_run = _produced_bundles([[1], [2]])
+    for bundle in second_run:
+        task._output_ready_callback(bundle)
+    assert not producer.has_next()
+    assert producer._reconstruction_outputs == {
+        plans[0]: {(seed_id, 0): second_run[0]},
+        plans[1]: {(seed_id, 1): second_run[1]},
+    }
+
+    # Completing releases each child once, under its own plan and stamped for the
+    # consumer, and discharges both plans on the seed.
+    task._task_done_callback(
+        None, None, TaskExecDriverStats(task_output_backpressure_s=0.0)
+    )
+    released = []
+    while producer.has_next():
+        released.append(producer.get_next())
+    assert [bundle.block_refs for bundle in released] == [
+        second_run[0].block_refs,
+        second_run[1].block_refs,
+    ]
+    assert consumer._pending_child_ids == {
+        second_run[0].block_refs[0].hex(): (child_ids[0], plans[0]),
+        second_run[1].block_refs[0].hex(): (child_ids[1], plans[1]),
+    }
+    assert producer._reconstruction_outputs == {}
+
+    # Releasing is not discharging: a plan gives up its claim on a block when the
+    # child is *submitted*, so both plans still owe their child until that happens.
+    for plan_id in plans:
+        assert tracker.get_pending_children(seed_id, plan_id) != {}
+
+    consumer.start(ExecutionOptions(), noop_counter())  # noqa: F405
+    for bundle in released:
+        consumer._submit_data_task(MagicMock(), bundle)
+    for plan_id in plans:
+        assert tracker.get_pending_children(seed_id, plan_id) == {}
+
+
+def test_recover_lost_object_joins_a_queued_seed_reinjection(
+    ray_start_regular_shared,  # noqa: F405
+):
+    """Two losses under one seed, recovered one after the other, re-inject it once.
+
+    This is the driver-side glue: the second call must find the first call's
+    re-injection still queued on the seed's operator and attach its plan, rather
+    than queue the seed's input a second time.
+    """
+    from ray.data._internal.execution.interfaces.physical_operator import DataOpTask
+    from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+    from ray.data._internal.execution.streaming_executor_state import (
+        _recover_lost_object,
+    )
+    from ray.data._internal.execution.util import make_ref_bundles
+
+    ctx = DataContext.get_current()
+    seed_input = make_ref_bundles([[0]])[0]
+    source = InputDataBuffer(ctx, [seed_input])
+    producer = MapOperator.create(
+        create_map_transformer_from_block_fn(lambda block, _: block),
+        input_op=source,
+        data_context=ctx,
+        name="Seed",
+    )
+    consumer = MapOperator.create(
+        create_map_transformer_from_block_fn(lambda block, _: block),
+        input_op=producer,
+        data_context=ctx,
+        name="Consumer",
+    )
+    tracker = LineageTracker()
+    producer._lineage_tracker = tracker
+    consumer._lineage_tracker = tracker
+    # `_recover_lost_object` only needs the op states for latch resets and the
+    # source's `add_output`, so stand-ins suffice.
+    topology = {op: MagicMock() for op in (source, producer, consumer)}
+
+    seed_id = f"{producer.id}:0"
+    child_ids = [f"{consumer.id}:{index}" for index in range(2)]
+    outputs = make_ref_bundles([[1], [2]])
+    tracker.register_task_submission(seed_id, [])
+    producer._seed_task_inputs[seed_id] = seed_input
+    for index, (child_id, bundle) in enumerate(zip(child_ids, outputs)):
+        tracker.register_output(seed_id, bundle.block_refs[0].hex(), index)
+        tracker.register_task_submission(
+            child_id, tracker.resolve_dependencies([bundle.block_refs[0].hex()])
+        )
+    tracker.register_task_complete(seed_id)
+
+    def lost(child_id):
+        return DataOpTask(
+            0,
+            MagicMock(),  # streaming_gen
+            MagicMock(),  # block_ref_counter
+            consumer.id,
+            operator_name=consumer.name,
+            data_task_id=child_id,
+        )
+
+    error = ObjectLostError(ray.ObjectRef.nil().hex(), None, "injected by test")
+    state = MagicMock()
+    state.op = consumer
+
+    assert _recover_lost_object(topology, tracker, state, lost(child_ids[0]), error)
+    assert _recover_lost_object(topology, tracker, state, lost(child_ids[1]), error)
+
+    # The seed's input was queued once, and that one stamp carries both plans.
+    assert topology[source].add_output.call_count == 1
+    (queued,) = producer._pending_seed_ids.values()
+    ((queued_seed_id, queued_plans),) = queued
+    assert queued_seed_id == seed_id
+    # A plan is keyed by the id of the task whose failure opened it.
+    assert queued_plans == set(child_ids)
+    assert producer._num_seed_reinjections_joined == 1
 
 
 if __name__ == "__main__":
