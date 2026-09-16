@@ -1701,6 +1701,52 @@
     timeout: 3600
     script: python image_embedding_from_jsonl/main.py {{args}}
 
+# Chaos A/B for the text_embedding workload, batching ON. Its August counterpart ran
+# on the pre-batching prototype, so this is the batched arm of that comparison.
+# No output verifier exists for this workload, so it measures walltime and recovery
+# count only -- correctness is covered by the uris and backpressure cases.
+- name: text_embedding_fixed_size_chaos_{{recovery_mode}}
+  python: "3.10"
+  group: data-lineage-recovery
+
+  matrix:
+    setup:
+      recovery_mode: []
+      data_recovery: []
+      core_pinning: []
+    adjustments:
+      - with:
+          recovery_mode: data
+          data_recovery: 1
+          core_pinning: 0
+      - with:
+          recovery_mode: core
+          data_recovery: 0
+          core_pinning: 1
+
+  cluster:
+    anyscale_sdk_2026: true
+    cluster_compute: text_embedding/fixed_size_cluster_compute.yaml
+    byod:
+      type: cu123
+      post_build_script: byod_install_text_embedding.sh
+      runtime_env:
+        # Declaring a ``runtime_env`` REPLACES the DEFAULTS list rather than
+        # extending it, so the standard guards are re-listed here.
+        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
+        - RAYTEST_FAIL_ON_WORKER_OOM=1
+        # Chaos kills nodes on purpose, and the backlog it creates spills.
+        - RAYTEST_FAIL_ON_DEAD_NODES=0
+        - RAYTEST_FAIL_ON_SPILLING=0
+        - RAYTEST_MAX_OBJ_STORE_UTIL_PERCENT=100
+        - RAY_DATA_ENABLE_SEED_INPUT_LINEAGE_RECOVERY={{data_recovery}}
+        - RAY_lineage_pinning_enabled={{core_pinning}}
+
+  run:
+    timeout: 3600
+    script: >
+      python text_embedding/main.py --inference-concurrency 100 100 --chaos
+
 - name: text_embedding_{{case}}
   python: "3.10"
   frequency: weekly
