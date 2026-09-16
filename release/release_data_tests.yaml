@@ -1313,6 +1313,55 @@
     script: >
       python backpressure_benchmark.py --case many-tiny-objects
 
+# Object-loss recovery under chaos, run as an A/B so the two mechanisms are
+# measured on identical work: `data` uses Ray Data seed-input lineage recovery
+# with Core lineage pinning off; `core` is the control, using Ray Core object
+# reconstruction alone. The `data` arm asserts `lineage_recoveries > 0`, so it
+# fails loudly if chaos never actually lost an object the pipeline needed.
+- name: backpressure_lineage_recovery_chaos_{{recovery_mode}}
+  python: "3.10"
+  group: data-backpressure
+
+  matrix:
+    setup:
+      recovery_mode: []
+      data_recovery: []
+      core_pinning: []
+    adjustments:
+      - with:
+          recovery_mode: data
+          data_recovery: 1
+          core_pinning: 0
+      - with:
+          recovery_mode: core
+          data_recovery: 0
+          core_pinning: 1
+
+  cluster:
+    anyscale_sdk_2026: true
+    cluster_compute: fixed_size_8_cpu_compute.yaml
+    byod:
+      runtime_env:
+        # Declaring a ``runtime_env`` REPLACES the DEFAULTS list rather than
+        # extending it, so the standard guards are re-listed here.
+        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
+        - RAYTEST_FAIL_ON_WORKER_OOM=1
+        # Chaos terminates nodes on purpose, so dead nodes are expected. Spills
+        # are allowed because backpressure intentionally builds a queue.
+        - RAYTEST_FAIL_ON_DEAD_NODES=0
+        - RAYTEST_FAIL_ON_SPILLING=0
+        - RAY_DATA_ENABLE_SEED_INPUT_LINEAGE_RECOVERY={{data_recovery}}
+        - RAY_lineage_pinning_enabled={{core_pinning}}
+
+  run:
+    timeout: 3600
+    # --chaos-max-kills bounds the kills so the cluster is not degraded faster
+    # than nodes are replaced (8 fixed workers).
+    script: >
+      python backpressure_benchmark.py --case fast-producer-slow-consumer
+      --chaos --chaos-type TerminateEC2Instance --chaos-max-kills 3
+      --recovery-mode {{recovery_mode}}
+
 - name: backpressure_training_prefetch
   python: "3.10"
   group: data-backpressure
