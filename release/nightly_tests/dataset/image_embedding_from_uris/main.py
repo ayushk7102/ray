@@ -25,7 +25,7 @@ import random
 import time
 from ray.data.expressions import download
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from ray._private.test_utils import EC2InstanceTerminatorWithGracePeriod
+from ray._private.test_utils import RayletKiller
 
 
 WRITE_PATH = os.environ.get("RAY_DATA_WRITE_PATH") or (
@@ -218,6 +218,13 @@ def main(args: argparse.Namespace):
     if args.chaos:
         start_chaos()
 
+    recovery_state = None
+    if (
+        args.chaos
+        and ray.data.DataContext.get_current().enable_seed_input_lineage_recovery
+    ):
+        recovery_state = install_recovery_counter()
+
     print("Creating metadata")
     metadata = create_metadata(scale_factor=args.scale_factor)
 
@@ -256,7 +263,22 @@ def main(args: argparse.Namespace):
     metrics["runtime_env_setup"] = RuntimeEnvSetupTracker.collect()
     benchmark.result["main"].update(metrics)
 
+    # Recorded before `write_result` so the count actually reaches result.json.
+    if recovery_state is not None:
+        benchmark.result["main"]["lineage_recoveries"] = recovery_state["recoveries"]
+
     benchmark.write_result()
+
+    if recovery_state is not None:
+        # The run completing proves the dataset survived chaos; this asserts it
+        # survived *because of* recovery. Without it a run where chaos never lost a
+        # needed object passes silently and verifies nothing about reconstruction.
+        # Asserted after `write_result` so the count is still reported on failure.
+        assert recovery_state["recoveries"] > 0, (
+            "Chaos was enabled but Ray Data seed-input lineage recovery never fired "
+            "-- no object the pipeline needed was lost, so this run did not exercise "
+            "recovery."
+        )
 
     if args.verify_output:
         # Verified with pyarrow rather than Ray Data: checking Ray Data's output with
@@ -270,6 +292,32 @@ def main(args: argparse.Namespace):
             )
 
 
+def install_recovery_counter() -> dict:
+    """Count Ray Data seed-input lineage recoveries for this run.
+
+    Wraps ``LineageTracker.register_task_failed``, which the executor calls once
+    per detected loss, so the run can assert recovery actually fired rather than
+    passing because chaos never lost anything. The streaming executor runs on this
+    (driver) process, so patching the class here observes its tracker instance.
+
+    Counts only calls that return seed ids: an empty list means reconstruction of
+    that lineage was already under way and nothing was resubmitted.
+    """
+    from ray.data._internal.execution import lineage_tracker as lt_mod
+
+    state = {"recoveries": 0}
+    original = lt_mod.LineageTracker.register_task_failed
+
+    def counting_register_task_failed(self, data_task_id, plan_id=None):
+        seed_task_ids, assigned_plan_id = original(self, data_task_id, plan_id)
+        if seed_task_ids:
+            state["recoveries"] += 1
+        return seed_task_ids, assigned_plan_id
+
+    lt_mod.LineageTracker.register_task_failed = counting_register_task_failed
+    return state
+
+
 def start_chaos():
     assert ray.is_initialized()
 
@@ -277,9 +325,25 @@ def start_chaos():
     scheduling_strategy = NodeAffinitySchedulingStrategy(
         node_id=head_node_id, soft=False
     )
-    resource_killer = EC2InstanceTerminatorWithGracePeriod.options(
+    # `RayletKiller`, not an EC2 terminator: killing the raylet takes the node's
+    # object store down with it, so the objects it held are lost immediately.
+    # A terminator *with a grace period* drains the node instead, which is why the
+    # previous run finished with zero `ObjectLostError` and never exercised
+    # recovery at all -- the pipeline simply never lost anything.
+    #
+    # `kill_delay_s` lets the pipeline build a backlog of produced blocks first, so
+    # a kill reliably takes out objects that downstream tasks still need rather
+    # than landing before there is anything to lose. `max_to_kill` bounds the
+    # damage so the cluster is not degraded faster than nodes are replaced.
+    # `NodeKillerBase` keeps at least one worker alive on its own.
+    resource_killer = RayletKiller.options(
         scheduling_strategy=scheduling_strategy
-    ).remote(head_node_id, max_to_kill=None)
+    ).remote(
+        head_node_id,
+        kill_interval_s=60,
+        kill_delay_s=60,
+        max_to_kill=5,
+    )
 
     ray.get(resource_killer.ready.remote())
 
