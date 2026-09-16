@@ -1,5 +1,6 @@
 import argparse
 import io
+import os
 import uuid
 from typing import Any, Dict
 
@@ -27,7 +28,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray._private.test_utils import EC2InstanceTerminatorWithGracePeriod
 
 
-WRITE_PATH = f"s3://ray-data-write-benchmark/{uuid.uuid4().hex}"
+WRITE_PATH = os.environ.get("RAY_DATA_WRITE_PATH") or (
+    f"s3://ray-data-write-benchmark/{uuid.uuid4().hex}"
+)
 BUCKET = "ray-benchmark-data-internal-us-west-2"
 
 # Assumptions: homogenously shaped images, homogenous images
@@ -74,13 +77,22 @@ def parse_args() -> argparse.Namespace:
             "every minute with a grace period."
         ),
     )
+    parser.add_argument(
+        "--verify-output",
+        action="store_true",
+        help=(
+            "After the write, check the sink against the analytically-known key set "
+            "(see verify_output.py) and fail the run if it does not match. Off by "
+            "default so the stock benchmark path is unchanged."
+        ),
+    )
     return parser.parse_args()
 
 
 def create_metadata(scale_factor: int):
     # TODO(mowen): Handle repeats of the dataset if scale_factor > 1
     # simulate various text metadata fields alongside image metadata
-    return pd.DataFrame(
+    metadata = pd.DataFrame(
         [
             {
                 "metadata_0": "".join(random.choices(string.ascii_letters, k=16)),
@@ -101,6 +113,12 @@ def create_metadata(scale_factor: int):
             for i in range(NUM_CONTAINERS)
         ]
     )
+    # Dense positional id over the frame above, so `(row_serial, patch_x, patch_y)`
+    # is a primary key over the sink. Read from the source ordering rather than
+    # stamped per attempt, so a re-executed task reproduces the same values --
+    # a per-attempt counter would make output verification vacuous.
+    metadata["row_serial"] = np.arange(len(metadata), dtype=np.int64)
+    return metadata
 
 
 def combine_channels(row: Dict[str, Any]) -> Dict[str, np.ndarray]:
@@ -239,6 +257,17 @@ def main(args: argparse.Namespace):
     benchmark.result["main"].update(metrics)
 
     benchmark.write_result()
+
+    if args.verify_output:
+        # Verified with pyarrow rather than Ray Data: checking Ray Data's output with
+        # Ray Data would let a bug cancel itself out.
+        from verify_output import verify
+
+        print(f"Verifying sink {WRITE_PATH}")
+        if verify(WRITE_PATH, expect_rows_missing_ok=False) != 0:
+            raise RuntimeError(
+                f"Output verification failed for {WRITE_PATH}; see the checks above."
+            )
 
 
 def start_chaos():
