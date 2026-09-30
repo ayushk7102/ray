@@ -650,6 +650,13 @@ def transform_frame(preprocessor, frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def fitted_n_scaler(scaler_cls=StandardScaler):
+    """A scaler on column `n`, fitted to the values 1-4"""
+    return scaler_cls(columns=["n"]).fit(
+        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
+    )
+
+
 def assert_column_equals(rows, name, expected):
     """The column must hold the expected numbers, not a cast-back rendering.
 
@@ -749,9 +756,7 @@ def test_transform_batch_on_an_empty_batch(arrow_backed):
     if arrow_backed:
         frame = frame.convert_dtypes(dtype_backend="pyarrow")
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     out = transform_frame(scaler, frame)
 
     assert len(out) == 0
@@ -771,9 +776,7 @@ def test_transform_batch_matches_the_input_backing(arrow_backed):
     if arrow_backed:
         frame = frame.convert_dtypes(dtype_backend="pyarrow")
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     out = transform_frame(scaler, frame)
 
     backed = {
@@ -809,9 +812,7 @@ def test_transform_batch_keeps_pass_through_extension_dtypes(name):
     values, expected_dtype = PASS_THROUGH_DTYPES[name]
     frame = pd.DataFrame({"n": [1, 2, 3, 4], "passthrough": values})
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     out = transform_frame(scaler, frame)
 
     assert (
@@ -839,9 +840,7 @@ def test_transform_batch_decides_the_backing_per_column():
         }
     )
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     out = transform_frame(scaler, frame)
 
     assert {name: str(dtype) for name, dtype in out.dtypes.items()} == {
@@ -976,9 +975,7 @@ def test_transform_batch_preserves_the_index(name, arrow_backed):
     frame = frame.set_index(index)
     frame.columns.name = "feature"
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     out = transform_frame(scaler, frame)
 
     np.testing.assert_allclose(
@@ -1015,9 +1012,7 @@ def test_transform_batch_leaves_untouched_columns_exactly_as_they_were(name):
     """
     frame = pd.DataFrame({"n": [1, 2, 3, 4], "other": UNTOUCHED_COLUMNS[name]()})
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     out = transform_frame(scaler, frame)
 
     pd.testing.assert_series_equal(out["other"], frame["other"])
@@ -1033,9 +1028,7 @@ def test_transform_batch_keeps_integer_column_labels():
         {0: [1.0, 2.0, 3.0, 4.0], 1: [5.0, 6.0, 7.0, 8.0], "n": [1, 2, 3, 4]}
     )
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     out = transform_frame(scaler, frame)
 
     assert list(out.columns) == [0, 1, "n"]
@@ -1052,9 +1045,7 @@ def test_transform_batch_does_not_modify_the_callers_frame():
     )
     before = frame.copy(deep=True)
 
-    scaler = StandardScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler()
     scaler.transform_batch(frame)
 
     pd.testing.assert_frame_equal(frame, before)
@@ -1074,9 +1065,7 @@ def test_transform_batch_rejects_a_transform_that_changes_the_row_count():
     with a different number of rows cannot be lined up with it.
     """
     frame = pd.DataFrame({"n": [1, 2, 3, 4], "k": [5, 6, 7, 8]})
-    scaler = _FilteringScaler(columns=["n"]).fit(
-        ray.data.from_arrow(pa.table({"n": [1, 2, 3, 4]}))
-    )
+    scaler = fitted_n_scaler(_FilteringScaler)
 
     with pytest.raises(ValueError, match="rows for a batch of 4"):
         scaler.transform_batch(frame)
