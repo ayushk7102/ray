@@ -26,6 +26,15 @@ import time
 from ray.data.expressions import download
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray._private.test_utils import RayletKiller
+from ray.job_config import JobConfig
+
+# Node-kill intensity for --chaos-scale on the 100-node GPU cluster. Medium is the
+# original setting. Each value is (kill_interval_s, kill_delay_s, max_to_kill).
+CHAOS_SCALES = {
+    "low": (60, 60, 2),
+    "medium": (60, 60, 5),
+    "high": (30, 60, 15),
+}
 
 
 WRITE_PATH = os.environ.get("RAY_DATA_WRITE_PATH") or (
@@ -75,6 +84,23 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Whether to enable chaos. If set, this script terminates one worker node "
             "every minute with a grace period."
+        ),
+    )
+    parser.add_argument(
+        "--chaos-scale",
+        choices=sorted(CHAOS_SCALES),
+        default="medium",
+        help="Node-kill intensity when --chaos is set. See CHAOS_SCALES.",
+    )
+    parser.add_argument(
+        "--recovery-mode",
+        choices=["data", "core"],
+        default="core",
+        help=(
+            "'data' starts the driver with "
+            "JobConfig(_disable_job_level_lineage_reconstruction=True), so Ray Data "
+            "reconstructs lost objects and Core does not, and asserts recovery "
+            "fired under chaos. 'core' keeps the default job config."
         ),
     )
     parser.add_argument(
@@ -216,13 +242,15 @@ def main(args: argparse.Namespace):
     benchmark = Benchmark()
 
     if args.chaos:
-        start_chaos()
+        start_chaos(args.chaos_scale)
 
     recovery_state = None
-    if (
-        args.chaos
-        and ray.data.DataContext.get_current().enable_seed_input_lineage_recovery
-    ):
+    if args.chaos and args.recovery_mode == "data":
+        assert ray.data.DataContext.get_current().enable_ray_data_reconstruction, (
+            "Chaos is enabled with --recovery-mode data, but Ray Data "
+            "reconstruction is off. Check that the driver started with "
+            "JobConfig(_disable_job_level_lineage_reconstruction=True)."
+        )
         recovery_state = install_recovery_counter()
 
     print("Creating metadata")
@@ -318,7 +346,7 @@ def install_recovery_counter() -> dict:
     return state
 
 
-def start_chaos():
+def start_chaos(chaos_scale: str = "medium"):
     assert ray.is_initialized()
 
     head_node_id = ray.get_runtime_context().get_node_id()
@@ -336,13 +364,19 @@ def start_chaos():
     # than landing before there is anything to lose. `max_to_kill` bounds the
     # damage so the cluster is not degraded faster than nodes are replaced.
     # `NodeKillerBase` keeps at least one worker alive on its own.
+    kill_interval_s, kill_delay_s, max_to_kill = CHAOS_SCALES[chaos_scale]
+    print(
+        f"[CHAOS] RayletKiller scale={chaos_scale} interval={kill_interval_s}s "
+        f"delay={kill_delay_s}s max_to_kill={max_to_kill}",
+        flush=True,
+    )
     resource_killer = RayletKiller.options(
         scheduling_strategy=scheduling_strategy
     ).remote(
         head_node_id,
-        kill_interval_s=60,
-        kill_delay_s=60,
-        max_to_kill=5,
+        kill_interval_s=kill_interval_s,
+        kill_delay_s=kill_delay_s,
+        max_to_kill=max_to_kill,
     )
 
     ray.get(resource_killer.ready.remote())
@@ -352,5 +386,12 @@ def start_chaos():
 
 if __name__ == "__main__":
     args = parse_args()
-    ray.init(runtime_env={"py_modules": benchmark_py_modules()})
+    init_kwargs = {}
+    if args.recovery_mode == "data":
+        # Ray Data reconstruction is gated on this job config. It also turns Core
+        # lineage reconstruction off for the job.
+        init_kwargs["job_config"] = JobConfig(
+            _disable_job_level_lineage_reconstruction=True
+        )
+    ray.init(runtime_env={"py_modules": benchmark_py_modules()}, **init_kwargs)
     main(args)

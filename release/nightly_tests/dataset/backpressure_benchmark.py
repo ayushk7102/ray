@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pyarrow as pa
 import ray
+from ray.job_config import JobConfig
 from ray._private.test_utils import (
     EC2InstanceTerminator,
     EC2InstanceTerminatorWithGracePeriod,
@@ -28,6 +29,15 @@ CHAOS_KILLERS = {
     "KillWorker": WorkerKillerActor,
     "TerminateEC2Instance": EC2InstanceTerminator,
     "TerminateEC2InstanceWithGracePeriod": EC2InstanceTerminatorWithGracePeriod,
+}
+
+
+# Node-kill intensity for --chaos-scale on the 8-worker fixed cluster. Medium is
+# the original setting. Each value is (kill_interval_s, kill_delay_s, max_to_kill).
+CHAOS_SCALES = {
+    "low": (30, 20, 1),
+    "medium": (30, 20, 3),
+    "high": (15, 20, 6),
 }
 
 
@@ -78,16 +88,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--chaos-scale",
+        choices=sorted(CHAOS_SCALES),
+        default="medium",
+        help="Node-kill intensity when --chaos is set. See CHAOS_SCALES.",
+    )
+    parser.add_argument(
         "--recovery-mode",
         choices=["data", "core"],
         default="data",
         help=(
             "Which lineage-recovery backend the chaos run relies on. 'data' "
             "(default) uses Ray Data seed-input lineage recovery and asserts it "
-            "fired. 'core' uses Ray Core object reconstruction only -- run with "
-            "Data seed-input recovery OFF (do not set "
-            "RAY_DATA_ENABLE_SEED_INPUT_LINEAGE_RECOVERY) and Core reconstruction "
-            "ON. This is the Core-only control: it skips the Data-recovery "
+            "fired. It starts the driver with "
+            "JobConfig(_disable_job_level_lineage_reconstruction=True), which turns "
+            "Core reconstruction off and Data reconstruction on. 'core' keeps the "
+            "default job config, so Core reconstruction handles losses. This is "
+            "the Core-only control: it skips the Data-recovery "
             "assertions since Core recovers lost objects transparently, and "
             "'lineage_recoveries' will read 0 (any recovery came from Core)."
         ),
@@ -294,7 +311,11 @@ def install_recovery_counter() -> dict:
     return state
 
 
-def start_chaos(chaos_type: str = "TerminateEC2Instance", max_to_kill=None):
+def start_chaos(
+    chaos_type: str = "TerminateEC2Instance",
+    chaos_scale: str = "medium",
+    max_to_kill=None,
+):
     assert ray.is_initialized()
 
     resource_killer_cls = CHAOS_KILLERS[chaos_type]
@@ -310,12 +331,20 @@ def start_chaos(chaos_type: str = "TerminateEC2Instance", max_to_kill=None):
     # `kill_delay_s` lets the pipeline build a backlog of produced blocks on
     # worker nodes first, so a kill reliably loses objects that downstream tasks
     # still need. Keeps >=1 worker alive automatically (see NodeKillerBase).
+    kill_interval_s, kill_delay_s, scale_max_to_kill = CHAOS_SCALES[chaos_scale]
+    if max_to_kill is None:
+        max_to_kill = scale_max_to_kill
+    print(
+        f"[CHAOS] {chaos_type} scale={chaos_scale} interval={kill_interval_s}s "
+        f"delay={kill_delay_s}s max_to_kill={max_to_kill}",
+        flush=True,
+    )
     resource_killer = resource_killer_cls.options(
         scheduling_strategy=scheduling_strategy
     ).remote(
         head_node_id,
-        kill_interval_s=30,
-        kill_delay_s=20,
+        kill_interval_s=kill_interval_s,
+        kill_delay_s=kill_delay_s,
         max_to_kill=max_to_kill,
     )
 
@@ -340,12 +369,17 @@ def main(args: argparse.Namespace):
     else:
         raise ValueError(f"Unexpected benchmark case: {args.case}")
 
+    if args.recovery_mode == "data":
+        # Ray Data reconstruction is gated on this job config. It also turns Core
+        # lineage reconstruction off for the job.
+        ray.init(job_config=JobConfig(_disable_job_level_lineage_reconstruction=True))
+
     recovery_state = None
     if args.chaos and args.recovery_mode == "data":
-        assert ray.data.DataContext.get_current().enable_seed_input_lineage_recovery, (
-            "Chaos is enabled but seed-input lineage recovery is off. Run with "
-            "RAY_DATA_ENABLE_SEED_INPUT_LINEAGE_RECOVERY=1, or pass "
-            "--recovery-mode core to measure Ray Core reconstruction instead."
+        assert ray.data.DataContext.get_current().enable_ray_data_reconstruction, (
+            "Chaos is enabled with --recovery-mode data, but Ray Data "
+            "reconstruction is off. Check that the driver started with "
+            "JobConfig(_disable_job_level_lineage_reconstruction=True)."
         )
         # Only Data seed-input recovery has a LineageTracker to count. In 'core'
         # mode there is nothing to patch: Core recovers lost objects transparently.
@@ -355,7 +389,11 @@ def main(args: argparse.Namespace):
         # Started inside `run_fn`, where Ray is up: `start_chaos` needs the runtime
         # context to pin the killer actor to the head node.
         if args.chaos:
-            start_chaos(args.chaos_type, max_to_kill=args.chaos_max_kills)
+            start_chaos(
+                args.chaos_type,
+                chaos_scale=args.chaos_scale,
+                max_to_kill=args.chaos_max_kills,
+            )
         case_fn()
         if recovery_state is None:
             return {}

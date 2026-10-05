@@ -19,7 +19,8 @@ from PIL import Image
 from pybase64 import b64decode
 
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from ray._private.test_utils import EC2InstanceTerminatorWithGracePeriod
+from ray._private.test_utils import RayletKiller
+from ray.job_config import JobConfig
 from benchmark import (
     Benchmark,
     RuntimeEnvSetupTracker,
@@ -58,6 +59,14 @@ PROCESSOR = ViTImageProcessor(
     size={"height": 224, "width": 224},
 )
 
+# Node-kill intensity for --chaos-scale on the 140-node cluster. Each value is
+# (kill_interval_s, kill_delay_s, max_to_kill).
+CHAOS_SCALES = {
+    "low": (60, 60, 2),
+    "medium": (60, 60, 5),
+    "high": (30, 60, 15),
+}
+
 JOB_ID = os.environ.get("ANYSCALE_JOB_ID", f"local-{uuid.uuid4().hex[:8]}")
 SHARED_OUTDIR = f"/mnt/shared_storage/image_embedding_jsonl/{JOB_ID}"
 
@@ -75,8 +84,25 @@ def parse_args():
         "--chaos",
         action="store_true",
         help=(
-            "Whether to enable chaos. If set, this script terminates one worker node "
-            "every minute with a grace period."
+            "Whether to enable chaos. If set, this script kills worker raylets at "
+            "the rate set by --chaos-scale."
+        ),
+    )
+    parser.add_argument(
+        "--chaos-scale",
+        choices=sorted(CHAOS_SCALES),
+        default="medium",
+        help="Node-kill intensity when --chaos is set. See CHAOS_SCALES.",
+    )
+    parser.add_argument(
+        "--recovery-mode",
+        choices=["data", "core"],
+        default="core",
+        help=(
+            "'data' starts the driver with "
+            "JobConfig(_disable_job_level_lineage_reconstruction=True), so Ray Data "
+            "reconstructs lost objects and Core does not, and asserts recovery "
+            "fired under chaos. 'core' keeps the default job config."
         ),
     )
     parser.add_argument(
@@ -248,7 +274,16 @@ def main(args: argparse.Namespace, profiling: Profiling):
     benchmark = Benchmark()
 
     if args.chaos:
-        start_chaos()
+        start_chaos(args.chaos_scale)
+
+    recovery_state = None
+    if args.chaos and args.recovery_mode == "data":
+        assert ray.data.DataContext.get_current().enable_ray_data_reconstruction, (
+            "Chaos is enabled with --recovery-mode data, but Ray Data "
+            "reconstruction is off. Check that the driver started with "
+            "JobConfig(_disable_job_level_lineage_reconstruction=True)."
+        )
+        recovery_state = install_recovery_counter()
 
     # `default_map_logical_memory_enabled` is a best practice that's required for
     # Ray Data to prevent OOMs. It's not enabled by default in Ray 2.56, but we
@@ -310,7 +345,18 @@ def main(args: argparse.Namespace, profiling: Profiling):
         )
     benchmark.result["main"].update(metrics)
 
+    # Recorded before `write_result` so the count actually reaches result.json.
+    if recovery_state is not None:
+        benchmark.result["main"]["lineage_recoveries"] = recovery_state["recoveries"]
+
     benchmark.write_result()
+
+    if recovery_state is not None:
+        # Asserted after `write_result` so the count is still reported on failure.
+        assert recovery_state["recoveries"] > 0, (
+            "Chaos was enabled but Ray Data lineage reconstruction never fired, so "
+            "this run did not exercise recovery."
+        )
 
     if args.verify_output:
         # Verified with pyarrow rather than Ray Data: checking Ray Data's output
@@ -324,16 +370,52 @@ def main(args: argparse.Namespace, profiling: Profiling):
             )
 
 
-def start_chaos():
+def install_recovery_counter() -> dict:
+    """Count Ray Data lineage reconstructions for this run.
+
+    Wraps ``LineageTracker.register_task_failed``, which the executor calls once
+    per detected loss. The streaming executor runs on this (driver) process, so
+    patching the class here observes its tracker instance. Counts only calls that
+    return seed ids.
+    """
+    from ray.data._internal.execution import lineage_tracker as lt_mod
+
+    state = {"recoveries": 0}
+    original = lt_mod.LineageTracker.register_task_failed
+
+    def counting_register_task_failed(self, data_task_id, plan_id=None):
+        seed_task_ids, assigned_plan_id = original(self, data_task_id, plan_id)
+        if seed_task_ids:
+            state["recoveries"] += 1
+        return seed_task_ids, assigned_plan_id
+
+    lt_mod.LineageTracker.register_task_failed = counting_register_task_failed
+    return state
+
+
+def start_chaos(chaos_scale: str = "medium"):
     assert ray.is_initialized()
 
     head_node_id = ray.get_runtime_context().get_node_id()
     scheduling_strategy = NodeAffinitySchedulingStrategy(
         node_id=head_node_id, soft=False
     )
-    resource_killer = EC2InstanceTerminatorWithGracePeriod.options(
+    # `RayletKiller`, not a terminator with a grace period: a graceful terminator
+    # drains the node, so nothing is lost and reconstruction never runs.
+    kill_interval_s, kill_delay_s, max_to_kill = CHAOS_SCALES[chaos_scale]
+    print(
+        f"[CHAOS] RayletKiller scale={chaos_scale} interval={kill_interval_s}s "
+        f"delay={kill_delay_s}s max_to_kill={max_to_kill}",
+        flush=True,
+    )
+    resource_killer = RayletKiller.options(
         scheduling_strategy=scheduling_strategy
-    ).remote(head_node_id, max_to_kill=None)
+    ).remote(
+        head_node_id,
+        kill_interval_s=kill_interval_s,
+        kill_delay_s=kill_delay_s,
+        max_to_kill=max_to_kill,
+    )
 
     ray.get(resource_killer.ready.remote())
 
@@ -341,8 +423,15 @@ def start_chaos():
 
 
 if __name__ == "__main__":
-    ray.init(runtime_env={"py_modules": benchmark_py_modules()})
     args = parse_args()
+    init_kwargs = {}
+    if args.recovery_mode == "data":
+        # Ray Data reconstruction is gated on this job config. It also turns Core
+        # lineage reconstruction off for the job.
+        init_kwargs["job_config"] = JobConfig(
+            _disable_job_level_lineage_reconstruction=True
+        )
+    ray.init(runtime_env={"py_modules": benchmark_py_modules()}, **init_kwargs)
 
     # S3 sometimes returns transient ACCESS_DENIED on HeadObject under heavy
     # concurrent load (credential refresh or throttling). Retry these instead
