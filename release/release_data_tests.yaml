@@ -1001,14 +1001,13 @@
     cluster_compute: fixed_size_8_cpu_compute.yaml
     byod:
       runtime_env:
-        # Declaring a ``runtime_env`` REPLACES the DEFAULTS list rather than
-        # extending it, so the standard guards are re-listed here.
-        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
-        - RAYTEST_FAIL_ON_WORKER_OOM=1
-        # Chaos terminates nodes on purpose, so dead nodes are expected. Spills
-        # are allowed because backpressure intentionally builds a queue.
-        - RAYTEST_FAIL_ON_DEAD_NODES=0
-        - RAYTEST_FAIL_ON_SPILLING=0
+        # Merged over the DEFAULTS. Chaos kills nodes on purpose, so dead nodes
+        # and the workers that die with them are expected.
+        RAYTEST_FAIL_ON_DEAD_NODES: "0"
+        RAYTEST_FAIL_ON_UNEXPECTED_WORKER_FAILURE: "0"
+        # Lost objects and their re-produced copies coexist during recovery, so
+        # the object store utilization bound doesn't apply.
+        RAYTEST_MAX_OBJ_STORE_UTIL_PERCENT: "-1"
 
   run:
     timeout: 3600
@@ -1175,13 +1174,13 @@
     cluster_compute: image_embedding_from_uris/fixed_size_cluster_compute.yaml
     byod:
       runtime_env:
-        # Declaring a ``runtime_env`` REPLACES the DEFAULTS list rather than
-        # extending it, so the standard guards are re-listed here.
-        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
-        - RAYTEST_FAIL_ON_WORKER_OOM=1
-        # Chaos terminates nodes on purpose, and the backlog it creates spills.
-        - RAYTEST_FAIL_ON_DEAD_NODES=0
-        - RAYTEST_FAIL_ON_SPILLING=0
+        # Merged over the DEFAULTS. Chaos kills nodes on purpose, so dead nodes
+        # and the workers that die with them are expected.
+        RAYTEST_FAIL_ON_DEAD_NODES: "0"
+        RAYTEST_FAIL_ON_UNEXPECTED_WORKER_FAILURE: "0"
+        # Lost objects and their re-produced copies coexist during recovery, so
+        # the object store utilization bound doesn't apply.
+        RAYTEST_MAX_OBJ_STORE_UTIL_PERCENT: "-1"
 
   run:
     timeout: 3600
@@ -1250,13 +1249,13 @@
     cluster_compute: image_embedding_from_jsonl/fixed_size_cluster_compute.yaml
     byod:
       runtime_env:
-        # Declaring a ``runtime_env`` REPLACES the DEFAULTS list rather than
-        # extending it, so the standard guards are re-listed here.
-        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
-        - RAYTEST_FAIL_ON_WORKER_OOM=1
-        # Chaos terminates nodes on purpose, and the backlog it creates spills.
-        - RAYTEST_FAIL_ON_DEAD_NODES=0
-        - RAYTEST_FAIL_ON_SPILLING=0
+        # Merged over the DEFAULTS. Chaos kills nodes on purpose, so dead nodes
+        # and the workers that die with them are expected.
+        RAYTEST_FAIL_ON_DEAD_NODES: "0"
+        RAYTEST_FAIL_ON_UNEXPECTED_WORKER_FAILURE: "0"
+        # Lost objects and their re-produced copies coexist during recovery, so
+        # the object store utilization bound doesn't apply.
+        RAYTEST_MAX_OBJ_STORE_UTIL_PERCENT: "-1"
 
   run:
     timeout: 3600
