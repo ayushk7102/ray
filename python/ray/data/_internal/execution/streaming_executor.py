@@ -18,6 +18,9 @@ from ray.data._internal.execution.block_ref_counter import BlockRefCounter
 from ray.data._internal.execution.bundle_queue import ExactMultipleSize
 from ray.data._internal.execution.dataset_state import DatasetState
 from ray.data._internal.execution.execution_callback import ExecutionCallback
+from ray.data._internal.execution.external_consumer_tasks import (
+    ExternalConsumerTasks,
+)
 from ray.data._internal.execution.interfaces import (
     ExecutionOptions,
     Executor,
@@ -111,7 +114,10 @@ def _log_ray_data_env_vars() -> None:
 
 
 def _disable_data_reconstruction_if_unsupported(
-    dag: PhysicalOperator, options: ExecutionOptions, dataset_id: str
+    dag: PhysicalOperator,
+    options: ExecutionOptions,
+    dataset_id: str,
+    tracks_external_consumer_tasks: bool = False,
 ) -> bool:
     """Whether Ray Data lineage reconstruction must be disabled for this plan.
 
@@ -132,6 +138,9 @@ def _disable_data_reconstruction_if_unsupported(
         dag: The physical plan's output operator.
         options: The execution options of the dataset being executed.
         dataset_id: The ID of the dataset being executed.
+        tracks_external_consumer_tasks: Whether the executor's external
+            consumers report every task that consumes its outputs. See
+            ``StreamingExecutor.enable_external_consumer_tasks``.
 
     Returns:
         True if the plan contains an operator reconstruction does not support,
@@ -152,6 +161,16 @@ def _disable_data_reconstruction_if_unsupported(
             continue
         if isinstance(op, MapOperator) and not isinstance(
             op._block_ref_bundler._strategy, ExactMultipleSize
+        ):
+            continue
+        # PROTOTYPE: a non-equal split only routes whole blocks. An equal split
+        # slices blocks in untracked tasks, so it stays unsupported. A split's
+        # outputs are only covered when its consumers report the tasks that
+        # consume them, so a pull-based split stays unsupported too.
+        if (
+            isinstance(op, OutputSplitter)
+            and not op._equal
+            and tracks_external_consumer_tasks
         ):
             continue
         if log_once(f"ray_data_reconstruction_unsupported_{dataset_id}"):
@@ -235,6 +254,11 @@ class StreamingExecutor(Executor, threading.Thread):
         # inline fetcher reproduces the synchronous, master-identical path.
         self._metadata_fetcher = make_metadata_fetcher()
 
+        # PROTOTYPE: tasks outside the executor that consume its outputs, such
+        # as the push-based split's delivery of a block to a train worker. None
+        # unless `enable_external_consumer_tasks` was called.
+        self._external_consumer_tasks: Optional[ExternalConsumerTasks] = None
+
         Executor.__init__(self, self._data_context.execution_options)
         thread_name = f"StreamingExecutor-{self._dataset_id}"
         threading.Thread.__init__(self, daemon=True, name=thread_name)
@@ -295,7 +319,10 @@ class StreamingExecutor(Executor, threading.Thread):
         if (
             self._data_context.enable_ray_data_reconstruction
             and not _disable_data_reconstruction_if_unsupported(
-                dag, self._options, self._dataset_id
+                dag,
+                self._options,
+                self._dataset_id,
+                self._external_consumer_tasks is not None,
             )
         ):
             self._lineage_tracker = LineageTracker()
@@ -521,8 +548,15 @@ class StreamingExecutor(Executor, threading.Thread):
 
                 for callback in self._callbacks:
                     callback.on_execution_step(self)
-                if not continue_sched or self._shutdown:
+                if self._shutdown:
                     break
+                if not continue_sched:
+                    # An output taken by an external consumer is not done until
+                    # the task consuming it completes. If it is lost, the
+                    # executor must still be running to reconstruct it.
+                    if not self._has_unresolved_external_consumer_tasks():
+                        break
+                    time.sleep(0.05)
         except Exception as e:
             # Propagate it to the result iterator.
             exc = e
@@ -545,6 +579,37 @@ class StreamingExecutor(Executor, threading.Thread):
             return self._final_stats
         else:
             return self._generate_stats()
+
+    def enable_external_consumer_tasks(self) -> ExternalConsumerTasks:
+        """PROTOTYPE. Track every task outside the executor that consumes its
+        outputs, and return what the external consumer reports those tasks to.
+
+        Call before ``execute``, since it decides whether the plan supports
+        lineage reconstruction. The executor keeps running while any external
+        task is unresolved, so a lost input can still be reconstructed.
+        """
+        assert self._topology is None, "Enable before execute()."
+        self._external_consumer_tasks = ExternalConsumerTasks()
+        return self._external_consumer_tasks
+
+    def _has_unresolved_external_consumer_tasks(self) -> bool:
+        external_tasks = self._external_consumer_tasks
+        if external_tasks is None:
+            return False
+        if external_tasks.has_unresolved():
+            return True
+        # Outputs still waiting in the output queue count too. The operators can
+        # all complete long before a slow consumer drains the queue, and a block
+        # in the queue can be lost like a taken one.
+        output_op, output_state = self._output_node
+        if isinstance(output_op, OutputSplitter):
+            finished_splits = external_tasks.finished_splits()
+            return any(
+                output_state.output_queue.has_next(i)
+                for i in range(output_op.num_output_splits())
+                if i not in finished_splits
+            )
+        return output_state.output_queue.has_next()
 
     def set_external_consumer_bytes(self, num_bytes: int) -> None:
         """Set the bytes buffered by external consumers."""
@@ -597,6 +662,7 @@ class StreamingExecutor(Executor, threading.Thread):
             output_backpressure_guard=self._output_backpressure_guard,
             lineage_tracker=self._lineage_tracker,
             metadata_fetcher=self._metadata_fetcher,
+            external_consumer_tasks=self._external_consumer_tasks,
         )
         if self._max_errored_blocks > 0:
             self._max_errored_blocks -= num_errored_blocks
@@ -856,6 +922,8 @@ class _ClosingIterator(OutputIterator):
         try:
             op, state = self._executor._output_node
             bundle = state.get_output_blocking(output_split_idx)
+            if self._executor._external_consumer_tasks is not None:
+                self._executor._external_consumer_tasks.on_output_taken(bundle)
 
             # Update progress-bars
             if self._executor._progress_manager:

@@ -14,6 +14,8 @@ has room (see ``push_based_split_iterator.py`` for the consumer side).
 """
 
 import logging
+import os
+import queue as queue_module
 import threading
 import time
 from dataclasses import dataclass
@@ -24,12 +26,20 @@ from ray.data.context import DataContext
 from ray.util.debug import log_once
 
 if TYPE_CHECKING:
+    from ray.data._internal.execution.external_consumer_tasks import (
+        ExternalConsumerTasks,
+        ExternalTaskHandle,
+    )
     from ray.data._internal.execution.interfaces import NodeIdStr
     from ray.data.dataset import Dataset
 
 logger = logging.getLogger(__name__)
 
 BLOCKED_CLIENT_WARN_TIMEOUT = 30
+
+# PROTOTYPE knob: 0 restores #66466's fire-and-forget pushes, for measuring
+# the cost of tracking them.
+_TRACK_PUSHES = os.environ.get("RAY_DATA_PUSH_SPLIT_TRACK_PUSHES", "1") == "1"
 
 
 @dataclass
@@ -51,8 +61,34 @@ class _ExecutorError:
     error: Exception
 
 
+@dataclass
+class _LostBlock:
+    """PROTOTYPE. Placeholder for a pushed block whose input was lost before
+    delivery. The receiver skips its seq, and the re-produced block arrives
+    later under a new seq."""
+
+
 # Sequenced deliveries; errors arrive unsequenced (fail fast).
-_SequencedItem = Union[_BlockPush, _EndOfEpoch]
+_SequencedItem = Union[_BlockPush, _EndOfEpoch, _LostBlock]
+
+
+@dataclass
+class _PendingPush:
+    """PROTOTYPE. A push whose return ref hasn't resolved yet."""
+
+    split_idx: int
+    seq: int
+    # From ``ExternalConsumerTasks.submit``. The watcher reports whether the
+    # push delivered its block with it.
+    external_task: "ExternalTaskHandle"
+    num_rows: int
+    size_bytes: int
+
+
+# PROTOTYPE: put on the watcher's queue to tell the watcher thread to exit.
+_STOP_WATCHER = object()
+# PROTOTYPE: how long the watcher waits on pending pushes per pass.
+_WATCH_WAIT_TIMEOUT_S = 0.1
 
 
 def _create_split_dataset(
@@ -127,6 +163,15 @@ class _SplitFlow:
             self.bytes_pushed += size_bytes
             self.blocks_pushed += 1
 
+    def record_loss(self, num_rows: int, size_bytes: int) -> None:
+        """PROTOTYPE. Un-count a push whose block was lost before delivery, so
+        the window doesn't stay full while the block is reconstructed."""
+        with self.cond:
+            self.rows_pushed -= num_rows
+            self.bytes_pushed -= size_bytes
+            self.blocks_pushed -= 1
+            self.cond.notify()
+
     def finish(self) -> None:
         """Drop this split's contribution to flow and pacing state."""
         with self.cond:
@@ -178,6 +223,15 @@ class PushSplitCoordinator:
         self._consumers: Dict[int, Tuple[ray.actor.ActorHandle, str]] = {}
         self._pusher_threads: List[threading.Thread] = []
         self._pusher_stop_events: Dict[int, threading.Event] = {}
+        # PROTOTYPE: where each push is reported as an external task.
+        # Recreated with the executor every epoch. None when pushes aren't
+        # tracked.
+        self._external_consumer_tasks: Optional["ExternalConsumerTasks"] = None
+        # PROTOTYPE: the pushers hand each push to the watcher thread through
+        # this queue. Both are recreated every epoch, and are None when pushes
+        # aren't tracked.
+        self._pending_push_q: Optional[queue_module.Queue] = None
+        self._watcher_thread: Optional[threading.Thread] = None
 
         # Recreated every epoch, so a stale report can only land on the
         # previous epoch's discarded state.
@@ -382,6 +436,8 @@ class PushSplitCoordinator:
         """
         for event in self._pusher_stop_events.values():
             event.set()
+        if self._pending_push_q is not None:
+            self._pending_push_q.put(_STOP_WATCHER)
         if self._current_executor is not None:
             self._current_executor.shutdown(force=True)
         for thread in self._pusher_threads:
@@ -390,6 +446,11 @@ class PushSplitCoordinator:
                 logger.warning(f"Pusher thread {thread.name} did not exit in 10s.")
         self._pusher_threads = []
         self._pusher_stop_events = {}
+        if self._watcher_thread is not None:
+            self._watcher_thread.join(timeout=10)
+            if self._watcher_thread.is_alive():
+                logger.warning("Push watcher thread did not exit in 10s.")
+            self._watcher_thread = None
 
     def _try_start_new_epoch(self, starting_epoch: int) -> None:
         with self._lock:
@@ -406,6 +467,11 @@ class PushSplitCoordinator:
                         )
                     ds = self._base_dataset
                     self._current_executor = ds._create_executor()
+                    self._external_consumer_tasks = (
+                        self._current_executor.enable_external_consumer_tasks()
+                        if _TRACK_PUSHES
+                        else None
+                    )
                     self._output_iterator = ds._build_bundle_iterator(
                         self._current_executor
                     )
@@ -439,6 +505,21 @@ class PushSplitCoordinator:
     def _spawn_pushers(self) -> None:
         self._pusher_stop_events = {i: threading.Event() for i in range(self._n)}
         self._pusher_threads = []
+        self._pending_push_q = None
+        self._watcher_thread = None
+        if self._external_consumer_tasks is not None:
+            self._pending_push_q = queue_module.Queue()
+            self._watcher_thread = threading.Thread(
+                target=self._watcher_loop,
+                args=(
+                    self._cur_epoch,
+                    self._external_consumer_tasks,
+                    self._pending_push_q,
+                ),
+                name="push_split_watcher",
+                daemon=True,
+            )
+            self._watcher_thread.start()
         for i in range(self._n):
             thread = threading.Thread(
                 target=self._pusher_loop,
@@ -454,11 +535,13 @@ class PushSplitCoordinator:
         PushSplitReceiverMixin methods."""
         consumer, key = self._consumers[split_idx]
 
-        def push_block(seq, entry, size_bytes, num_rows):
+        def push_block(seq, entry, size_bytes, num_rows) -> ray.ObjectRef:
             # entry.ref is a top-level arg, so Ray resolves it and the
             # consumer receives the Block by value — no ObjectRef crosses
             # the wire, and the executor can free the block once delivered.
-            consumer._push_split_deliver.remote(
+            # The return ref resolves once the block is delivered, or raises
+            # if its input was lost.
+            return consumer._push_split_deliver.remote(
                 key, epoch_id, seq, _BlockPush(size_bytes, num_rows), entry.ref
             )
 
@@ -470,14 +553,21 @@ class PushSplitCoordinator:
         def push_error(error):
             consumer._push_split_deliver_error.remote(key, epoch_id, error)
 
-        return push_block, push_eof, push_error
+        def push_lost(seq):
+            consumer._push_split_deliver.remote(key, epoch_id, seq, _LostBlock())
+
+        return push_block, push_eof, push_error, push_lost
 
     def _pusher_loop(
         self, epoch_id: int, split_idx: int, stop: threading.Event
     ) -> None:
-        push_block, push_eof, push_error = self._make_consumer_ops(epoch_id, split_idx)
+        push_block, push_eof, push_error, _ = self._make_consumer_ops(
+            epoch_id, split_idx
+        )
         output_iterator = self._output_iterator
         assert output_iterator is not None
+        external_tasks = self._external_consumer_tasks
+        pending_push_q = self._pending_push_q
         flow = self._flows[split_idx]
         # Deliveries carry a sequence number; the receiver reorders them.
         seq = 0
@@ -510,7 +600,18 @@ class PushSplitCoordinator:
                         # still sends one block at a time. The consumer
                         # reports back this same count.
                         num_rows = max(1, flow.target_rows)
-                    push_block(seq, entry, size_bytes, num_rows)
+                    if external_tasks is not None:
+                        external_task = external_tasks.submit([entry.ref])
+                    push_ref = push_block(seq, entry, size_bytes, num_rows)
+                    if external_tasks is not None:
+                        pending_push_q.put(
+                            (
+                                push_ref,
+                                _PendingPush(
+                                    split_idx, seq, external_task, num_rows, size_bytes
+                                ),
+                            )
+                        )
                     seq += 1
                     flow.record_push(num_rows, size_bytes)
                 self._update_external_consumer_bytes()
@@ -533,12 +634,96 @@ class PushSplitCoordinator:
                     push_error(_ExecutorError(RuntimeError(repr(e))))
             return
 
+    def _watcher_loop(
+        self,
+        epoch_id: int,
+        external_tasks: "ExternalConsumerTasks",
+        pending_push_q: queue_module.Queue,
+    ) -> None:
+        """PROTOTYPE. Resolve pushes and report each one as an external task.
+
+        Shaped like ``ThreadedMetadataFetcher``'s fetch thread. The pushers hand
+        each push to this thread through ``pending_push_q``, and only this thread
+        touches the pushes it waits on.
+
+        Delivered: the external task completes. Input lost: the receiver gets a
+        placeholder for the seq, the split's window is un-counted, and the lost
+        input is reported, so the executor re-produces the block. Any other
+        error, e.g. the consumer died: the external task is abandoned.
+
+        TODO(push-split): a push whose input dies mid-fetch can hang without
+        resolving. It needs a deadline plus a location check.
+        """
+        from ray.exceptions import ObjectLostError, RayTaskError
+
+        consumer_ops = {i: self._make_consumer_ops(epoch_id, i) for i in range(self._n)}
+        pending_pushes: Dict[ray.ObjectRef, _PendingPush] = {}
+        while True:
+            # Block on the queue only when idle. While pushes are pending, don't
+            # block here, so they keep getting resolved.
+            try:
+                item = pending_push_q.get(block=not pending_pushes)
+            except queue_module.Empty:
+                item = None
+            # Drain whatever else is already queued into this pass.
+            while item is not None:
+                if item is _STOP_WATCHER:
+                    # The epoch is being torn down, so drop the pending pushes.
+                    return
+                push_ref, push = item
+                pending_pushes[push_ref] = push
+                try:
+                    item = pending_push_q.get_nowait()
+                except queue_module.Empty:
+                    item = None
+            if not pending_pushes:
+                continue
+
+            ready, _ = ray.wait(
+                list(pending_pushes),
+                num_returns=len(pending_pushes),
+                timeout=_WATCH_WAIT_TIMEOUT_S,
+                fetch_local=False,
+            )
+            for ref in ready:
+                push = pending_pushes.pop(ref)
+                try:
+                    ray.get(ref)
+                except ObjectLostError as e:
+                    # A push whose input was lost raises the loss wrapped in
+                    # RayTaskError. Unwrap it so reconstruction errors report the
+                    # original loss.
+                    lost = e.cause if isinstance(e, RayTaskError) else e
+                    logger.warning(
+                        f"Push to split {push.split_idx} (seq {push.seq}) lost "
+                        "its input; reconstructing it."
+                    )
+                    self._flows[push.split_idx].record_loss(
+                        push.num_rows, push.size_bytes
+                    )
+                    push_lost = consumer_ops[push.split_idx][3]
+                    push_lost(push.seq)
+                    external_tasks.report_lost_input(push.external_task, lost)
+                except Exception:
+                    logger.warning(
+                        f"Push to split {push.split_idx} (seq {push.seq}) "
+                        "failed; abandoning it.",
+                        exc_info=True,
+                    )
+                    external_tasks.abandon(push.external_task)
+                else:
+                    external_tasks.complete(push.external_task)
+            if ready:
+                self._update_external_consumer_bytes()
+
     def _finish_split(self, epoch_id: int, split_idx: int) -> None:
         executor_to_shutdown = None
         with self._lock:
             if epoch_id != self._cur_epoch:
                 return
             self._finished_splits.add(split_idx)
+            if self._external_consumer_tasks is not None:
+                self._external_consumer_tasks.finish_split(split_idx)
             self._flows[split_idx].finish()
             if (
                 len(self._finished_splits) == self._n
