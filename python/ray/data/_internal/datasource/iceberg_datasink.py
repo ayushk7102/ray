@@ -66,12 +66,9 @@ def _merge_key_bounds(
     Returns:
         The number of rows folded into the bounds and the number dropped for a NULL key.
     """
-    import functools
-
     import pyarrow.compute as pc
 
-    masks = (pc.is_valid(keys_table[col]) for col in upsert_cols)
-    kept = keys_table.filter(functools.reduce(pc.and_, masks))
+    kept = keys_table.drop_null()
     dropped = len(keys_table) - len(kept)
     if len(kept) == 0:
         return 0, dropped
@@ -79,8 +76,6 @@ def _merge_key_bounds(
     for col in upsert_cols:
         min_max = pc.min_max(kept[col])
         col_min, col_max = min_max["min"].as_py(), min_max["max"].as_py()
-        if col_min is None:
-            continue
         if col in bounds:
             prev_min, prev_max = bounds[col]
             bounds[col] = (min(prev_min, col_min), max(prev_max, col_max))
