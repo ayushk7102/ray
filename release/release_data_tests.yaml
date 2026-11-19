@@ -1429,6 +1429,66 @@
       --fake-gpu {{chaos_args}} --chaos-min-alive-workers 100 --verify-output
       {{arm_args}}
 
+# Same comparison on the JSONL read with real GPUs (100 CPU + 40 g5.4xlarge nodes).
+- name: image_embedding_from_jsonl_fixed_size_{{case}}_reconstruction_benchmark_{{arm}}
+  python: "3.11"
+  frequency: manual
+  group: data-batch-inference
+
+  matrix:
+    setup:
+      case: []
+      chaos_args: []
+      arm: []
+      arm_args: []
+    adjustments:
+      - with:
+          case: cap8
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: cap8
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
+          arm: core
+          arm_args: ""
+      - with:
+          case: cap15
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 4 --chaos-max-kills 15
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: cap15
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 4 --chaos-max-kills 15
+          arm: core
+          arm_args: ""
+      - with:
+          case: cap30
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 8 --chaos-max-kills 30
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: cap30
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 8 --chaos-max-kills 30
+          arm: core
+          arm_args: ""
+
+  cluster:
+    anyscale_sdk_2026: true
+    cluster_compute: image_embedding_from_jsonl/fixed_size_cluster_compute.yaml
+    byod:
+      python_depset: torch_cu128_data_image_embedding_py3.11.lock
+      runtime_env:
+        RAYTEST_FAIL_ON_DEAD_NODES: "0"
+        RAYTEST_FAIL_ON_UNEXPECTED_WORKER_FAILURE: "0"
+        RAYTEST_MAX_OBJ_STORE_UTIL_PERCENT: "-1"
+
+  run:
+    timeout: 5400
+    script: >
+      python image_embedding_from_jsonl/main.py --inference-concurrency 40 40
+      {{chaos_args}} --chaos-min-alive-workers 100 --verify-output {{arm_args}}
+
 # Same comparison on image classification over parquet (10 GPU nodes). With 10 nodes
 # and at least 6 kept alive, kills wait for replacement nodes, so the higher caps may
 # not be reached before the run ends.
