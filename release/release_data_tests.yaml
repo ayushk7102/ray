@@ -1249,8 +1249,10 @@
       --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
       --chaos-min-alive-workers 12 --verify-output
 
-# Ray Data vs Ray Core lineage reconstruction under the same chaos. The kill cap gives
-# both arms the same number of kills, so their runtimes are comparable.
+# Ray Data vs Ray Core lineage reconstruction under the same chaos. A kill cap gives
+# both arms the same number of kills, so their runtimes are comparable. Bigger caps
+# kill more raylets per round, so both arms reach the cap well before the Core arm
+# finishes. With a batch size above 1, the last round can overshoot the cap.
 - name: image_embedding_from_uris_{{case}}_reconstruction_benchmark_{{arm}}
   python: "3.11"
   frequency: manual
@@ -1264,58 +1266,89 @@
       arm: []
       arm_args: []
     adjustments:
-      # 20 fake-GPU nodes. Core finishes in ~1500s, so 30 kills land in the first
-      # ~60% of the run.
       - with:
-          case: fake_gpu
+          case: fake_gpu_cap8
           cluster_type: fake_gpu_small
-          args: >-
-            --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12
-            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
-            --chaos-max-kills 30
+          args: --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
           arm: data
           arm_args: --lineage-reconstruction
       - with:
-          case: fake_gpu
+          case: fake_gpu_cap8
           cluster_type: fake_gpu_small
-          args: >-
-            --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12
-            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
-            --chaos-max-kills 30
+          args: --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
           arm: core
           arm_args: ""
-      # 100 GPU nodes. Core finishes in ~370s, so 8 kills land in the first ~60%
-      # of the run.
       - with:
-          case: fixed_size
-          cluster_type: fixed_size
-          args: >-
-            --inference-concurrency 100 100 --chaos-min-alive-workers 60
-            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
-            --chaos-max-kills 8
+          case: fake_gpu_cap15
+          cluster_type: fake_gpu_small
+          args: --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 15
           arm: data
           arm_args: --lineage-reconstruction
       - with:
-          case: fixed_size
-          cluster_type: fixed_size
-          args: >-
-            --inference-concurrency 100 100 --chaos-min-alive-workers 60
-            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
-            --chaos-max-kills 8
+          case: fake_gpu_cap15
+          cluster_type: fake_gpu_small
+          args: --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 15
           arm: core
           arm_args: ""
-      # No chaos. The cost of lineage tracking when nothing is lost.
       - with:
-          case: fixed_size
-          cluster_type: fixed_size
-          args: --inference-concurrency 100 100
-          arm: data_no_chaos
+          case: fake_gpu_cap30
+          cluster_type: fake_gpu_small
+          args: --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 30
+          arm: data
           arm_args: --lineage-reconstruction
       - with:
-          case: fixed_size
+          case: fake_gpu_cap30
+          cluster_type: fake_gpu_small
+          args: --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 30
+          arm: core
+          arm_args: ""
+      - with:
+          case: fixed_size_cap8
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100 --chaos-min-alive-workers 60 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: fixed_size_cap8
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100 --chaos-min-alive-workers 60 --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
+          arm: core
+          arm_args: ""
+      - with:
+          case: fixed_size_cap15
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100 --chaos-min-alive-workers 60 --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 4 --chaos-max-kills 15
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: fixed_size_cap15
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100 --chaos-min-alive-workers 60 --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 4 --chaos-max-kills 15
+          arm: core
+          arm_args: ""
+      - with:
+          case: fixed_size_cap30
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100 --chaos-min-alive-workers 60 --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 8 --chaos-max-kills 30
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: fixed_size_cap30
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100 --chaos-min-alive-workers 60 --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 8 --chaos-max-kills 30
+          arm: core
+          arm_args: ""
+      - with:
+          case: fixed_size_no_chaos
           cluster_type: fixed_size
           args: --inference-concurrency 100 100
-          arm: core_no_chaos
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: fixed_size_no_chaos
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100
+          arm: core
           arm_args: ""
 
   cluster:
@@ -1336,20 +1369,46 @@
 # Same comparison on the JSONL read (100 CPU + 40 fake-GPU nodes). Its blocks are cut
 # by size rather than by the input's structure, so this is the workload that checks a
 # reconstructed block holds the same rows.
-- name: image_embedding_from_jsonl_fake_gpu_reconstruction_benchmark_{{arm}}
+- name: image_embedding_from_jsonl_fake_gpu_{{case}}_reconstruction_benchmark_{{arm}}
   python: "3.11"
   frequency: manual
   group: data-batch-inference
 
   matrix:
     setup:
+      case: []
+      chaos_args: []
       arm: []
       arm_args: []
     adjustments:
       - with:
+          case: cap8
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
           arm: data
           arm_args: --lineage-reconstruction
       - with:
+          case: cap8
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
+          arm: core
+          arm_args: ""
+      - with:
+          case: cap15
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 4 --chaos-max-kills 15
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: cap15
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 4 --chaos-max-kills 15
+          arm: core
+          arm_args: ""
+      - with:
+          case: cap30
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 8 --chaos-max-kills 30
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: cap30
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 8 --chaos-max-kills 30
           arm: core
           arm_args: ""
 
@@ -1367,26 +1426,52 @@
     timeout: 5400
     script: >
       python image_embedding_from_jsonl/main.py --inference-concurrency 40 40
-      --fake-gpu --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
-      --chaos-max-kills 8 --chaos-min-alive-workers 100 --verify-output
+      --fake-gpu {{chaos_args}} --chaos-min-alive-workers 100 --verify-output
       {{arm_args}}
 
-# Same comparison on image classification over parquet (10 GPU nodes). One kill per
-# round, because each node holds a tenth of the cluster.
-- name: image_classification_from_parquet_reconstruction_benchmark_{{arm}}
+# Same comparison on image classification over parquet (10 GPU nodes). With 10 nodes
+# and at least 6 kept alive, kills wait for replacement nodes, so the higher caps may
+# not be reached before the run ends.
+- name: image_classification_from_parquet_{{case}}_reconstruction_benchmark_{{arm}}
   python: "3.11"
   frequency: manual
   group: data-batch-inference
 
   matrix:
     setup:
+      case: []
+      chaos_args: []
       arm: []
       arm_args: []
     adjustments:
       - with:
+          case: cap8
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
           arm: data
           arm_args: --lineage-reconstruction
       - with:
+          case: cap8
+          chaos_args: --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2 --chaos-max-kills 8
+          arm: core
+          arm_args: ""
+      - with:
+          case: cap15
+          chaos_args: --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 2 --chaos-max-kills 15
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: cap15
+          chaos_args: --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 2 --chaos-max-kills 15
+          arm: core
+          arm_args: ""
+      - with:
+          case: cap30
+          chaos_args: --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 4 --chaos-max-kills 30
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: cap30
+          chaos_args: --chaos --chaos-kill-interval-s 30 --chaos-kill-batch-size 4 --chaos-max-kills 30
           arm: core
           arm_args: ""
 
@@ -1411,9 +1496,7 @@
     script: >
       python image_classification_from_parquet/main.py
       --data-directory 300G-image-data-synthetic-raw-parquet --data-format parquet
-      --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 1
-      --chaos-max-kills 4 --chaos-min-alive-workers 6 --verify-output
-      {{arm_args}}
+      {{chaos_args}} --chaos-min-alive-workers 6 --verify-output {{arm_args}}
 
 
 - name: image_embedding_from_jsonl_{{case}}
