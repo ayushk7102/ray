@@ -1249,6 +1249,90 @@
       --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
       --chaos-min-alive-workers 12 --verify-output
 
+# Ray Data vs Ray Core lineage reconstruction under the same chaos. The kill cap gives
+# both arms the same number of kills, so their runtimes are comparable.
+- name: image_embedding_from_uris_{{case}}_reconstruction_benchmark_{{arm}}
+  python: "3.11"
+  frequency: manual
+  group: data-batch-inference
+
+  matrix:
+    setup:
+      case: []
+      cluster_type: []
+      args: []
+      arm: []
+      arm_args: []
+    adjustments:
+      # 20 fake-GPU nodes. Core finishes in ~1500s, so 30 kills land in the first
+      # ~60% of the run.
+      - with:
+          case: fake_gpu
+          cluster_type: fake_gpu_small
+          args: >-
+            --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12
+            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
+            --chaos-max-kills 30
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: fake_gpu
+          cluster_type: fake_gpu_small
+          args: >-
+            --inference-concurrency 20 20 --fake-gpu --chaos-min-alive-workers 12
+            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
+            --chaos-max-kills 30
+          arm: core
+          arm_args: ""
+      # 100 GPU nodes. Core finishes in ~370s, so 8 kills land in the first ~60%
+      # of the run.
+      - with:
+          case: fixed_size
+          cluster_type: fixed_size
+          args: >-
+            --inference-concurrency 100 100 --chaos-min-alive-workers 60
+            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
+            --chaos-max-kills 8
+          arm: data
+          arm_args: --lineage-reconstruction
+      - with:
+          case: fixed_size
+          cluster_type: fixed_size
+          args: >-
+            --inference-concurrency 100 100 --chaos-min-alive-workers 60
+            --chaos --chaos-kill-interval-s 60 --chaos-kill-batch-size 2
+            --chaos-max-kills 8
+          arm: core
+          arm_args: ""
+      # No chaos. The cost of lineage tracking when nothing is lost.
+      - with:
+          case: fixed_size
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100
+          arm: data_no_chaos
+          arm_args: --lineage-reconstruction
+      - with:
+          case: fixed_size
+          cluster_type: fixed_size
+          args: --inference-concurrency 100 100
+          arm: core_no_chaos
+          arm_args: ""
+
+  cluster:
+    anyscale_sdk_2026: true
+    cluster_compute: image_embedding_from_uris/{{cluster_type}}_cluster_compute.yaml
+    byod:
+      python_depset: torch_cu128_data_image_embedding_py3.11.lock
+      runtime_env:
+        RAYTEST_FAIL_ON_DEAD_NODES: "0"
+        RAYTEST_FAIL_ON_UNEXPECTED_WORKER_FAILURE: "0"
+        RAYTEST_MAX_OBJ_STORE_UTIL_PERCENT: "-1"
+
+  run:
+    timeout: 5400
+    script: >
+      python image_embedding_from_uris/main.py {{args}} {{arm_args}} --verify-output
+
 
 - name: image_embedding_from_jsonl_{{case}}
   python: "3.11"
