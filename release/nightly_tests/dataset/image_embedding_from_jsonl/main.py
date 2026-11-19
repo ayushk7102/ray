@@ -18,8 +18,6 @@ from transformers import ViTImageProcessor, ViTForImageClassification
 from PIL import Image
 from pybase64 import b64decode
 
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from ray._private.test_utils import EC2InstanceTerminatorWithGracePeriod
 from benchmark import (
     Benchmark,
     RuntimeEnvSetupTracker,
@@ -29,10 +27,20 @@ from benchmark import (
 from profiling.coordinator import Profiling
 from profiling import nvtx as profiling_nvtx
 from profiling.metrics import extract_pipeline_metrics
+from lineage_reconstruction_chaos import (
+    add_chaos_args,
+    assert_lineage_reconstruction_ran,
+    install_lineage_reconstruction_counter,
+    ray_init_kwargs,
+    start_chaos,
+    stop_chaos,
+)
 
 
 INPUT_PREFIX = "s3://ray-benchmark-data-internal-us-west-2/10TiB-jsonl-images"
-OUTPUT_PREFIX = f"s3://ray-data-write-benchmark/{uuid.uuid4().hex}"
+OUTPUT_PREFIX = os.environ.get("RAY_DATA_WRITE_PATH") or (
+    f"s3://ray-data-write-benchmark/{uuid.uuid4().hex}"
+)
 
 BATCH_SIZE = 1024
 # Ray Data can't prevent OOMs if you don't set `memory` for high-memory operations like
@@ -71,20 +79,22 @@ def parse_args():
         required=True,
         help="The minimum and maximum concurrency for the inference operator.",
     )
-    parser.add_argument(
-        "--chaos",
-        action="store_true",
-        help=(
-            "Whether to enable chaos. If set, this script terminates one worker node "
-            "every minute with a grace period."
-        ),
-    )
+    add_chaos_args(parser, min_alive_workers=100)
     parser.add_argument(
         "--fake-gpu",
         action="store_true",
         help=(
             "Use fake gpu mode if set. In this mode, Infer uses CPU nodes and sleeps "
             "for the time GPU based Infer takes to process one batch"
+        ),
+    )
+    parser.add_argument(
+        "--verify-output",
+        action="store_true",
+        help=(
+            "Read with include_paths and check per-file row counts against the "
+            "source corpus after the write (see verify_output.py), failing the run on "
+            "a mismatch."
         ),
     )
     return parser.parse_args()
@@ -99,14 +109,17 @@ def decode(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     image_data = b64decode(row["image"], None, True)
     image = Image.open(BytesIO(image_data))
     width, height = image.size
-    return [
-        {
-            "original_url": row["url"],
-            "original_width": width,
-            "original_height": height,
-            "image": np.asarray(image),
-        }
-    ]
+    decoded = {
+        "original_url": row["url"],
+        "original_width": width,
+        "original_height": height,
+        "image": np.asarray(image),
+    }
+    # The read only adds `path` under --verify-output. The source file is the only
+    # row identity this corpus has: every record is the same image and url.
+    if "path" in row:
+        decoded["source_file"] = row["path"]
+    return [decoded]
 
 
 def preprocess(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -184,6 +197,8 @@ class Infer:
                         "original_height": batch["original_height"],
                         "output": output.cpu().numpy(),
                     }
+                    if "source_file" in batch:
+                        result["source_file"] = batch["source_file"]
         else:
             next_tensor = torch.from_numpy(batch["image"]).to(
                 dtype=torch.float32, device=self._device, non_blocking=True
@@ -196,6 +211,8 @@ class Infer:
                 "original_height": batch["original_height"],
                 "output": output.cpu().numpy(),
             }
+            if "source_file" in batch:
+                result["source_file"] = batch["source_file"]
 
         return result
 
@@ -209,13 +226,16 @@ class FakeInfer:
         n = len(batch["original_url"])
         # Emulate the GPU forward pass: sleep for the batch's inference time.
         time.sleep(GPU_SECONDS_PER_IMAGE * n)
-        return {
+        result = {
             "original_url": batch["original_url"],
             "original_width": batch["original_width"],
             "original_height": batch["original_height"],
             # Real Infer returns model(...).logits, shape (n, 1000) float32.
             "output": np.zeros((n, 1000), dtype=np.float32),
         }
+        if "source_file" in batch:
+            result["source_file"] = batch["source_file"]
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +246,9 @@ class FakeInfer:
 def main(args: argparse.Namespace, profiling: Profiling):
     benchmark = Benchmark()
 
-    if args.chaos:
-        start_chaos()
+    reconstruction_state = None
+    if args.chaos and args.lineage_reconstruction:
+        reconstruction_state = install_lineage_reconstruction_counter()
 
     # `default_map_logical_memory_enabled` is a best practice that's required for
     # Ray Data to prevent OOMs. It's not enabled by default in Ray 2.56, but we
@@ -251,10 +272,15 @@ def main(args: argparse.Namespace, profiling: Profiling):
 
     num_gpus = max(args.inference_concurrency)
     ds_holder = {}
+    # `source_file` costs a column on every row, so it's only read when the output
+    # is going to be checked.
+    read_kwargs = {"include_paths": True} if args.verify_output else {}
 
     def benchmark_fn():
         ds = (
-            ray.data.read_json(INPUT_PREFIX, lines=True, memory=READ_MEMORY)
+            ray.data.read_json(
+                INPUT_PREFIX, lines=True, memory=READ_MEMORY, **read_kwargs
+            )
             .flat_map(decode)
             .map(preprocess)
             .map_batches(
@@ -264,6 +290,13 @@ def main(args: argparse.Namespace, profiling: Profiling):
         )
         ds.write_parquet(OUTPUT_PREFIX)
         ds_holder["ds"] = ds
+        if resource_killer is not None:
+            # Stopped inside `benchmark_fn` because `run_fn` queries every raylet
+            # for spill stats once this returns. That query fails on a node that
+            # was just killed but isn't marked dead yet.
+            stop_chaos(resource_killer)
+
+    resource_killer = start_chaos(args) if args.chaos else None
 
     benchmark.run_fn("main", benchmark_fn)
 
@@ -284,28 +317,40 @@ def main(args: argparse.Namespace, profiling: Profiling):
         )
     benchmark.result["main"].update(metrics)
 
+    if resource_killer is not None:
+        nodes_killed = ray.get(resource_killer.num_killed.remote())
+        print(f"Chaos killed {nodes_killed} worker raylets")
+        benchmark.result["main"]["nodes_killed"] = nodes_killed
+
+    # Recorded before `write_result` so the count actually reaches result.json.
+    if reconstruction_state is not None:
+        benchmark.result["main"]["lineage_reconstructions"] = reconstruction_state[
+            "reconstructions"
+        ]
+
     benchmark.write_result()
 
+    if reconstruction_state is not None:
+        # Asserted after `write_result` so the count is still reported on failure.
+        assert_lineage_reconstruction_ran(reconstruction_state)
 
-def start_chaos():
-    assert ray.is_initialized()
+    if args.verify_output:
+        # Verified with pyarrow rather than Ray Data: checking Ray Data's output with
+        # Ray Data would let a bug cancel itself out.
+        from verify_output import verify
 
-    head_node_id = ray.get_runtime_context().get_node_id()
-    scheduling_strategy = NodeAffinitySchedulingStrategy(
-        node_id=head_node_id, soft=False
-    )
-    resource_killer = EC2InstanceTerminatorWithGracePeriod.options(
-        scheduling_strategy=scheduling_strategy
-    ).remote(head_node_id, max_to_kill=None)
-
-    ray.get(resource_killer.ready.remote())
-
-    resource_killer.run.remote()
+        print(f"Verifying sink {OUTPUT_PREFIX}")
+        if verify(OUTPUT_PREFIX) != 0:
+            raise RuntimeError(
+                f"Output verification failed for {OUTPUT_PREFIX}; see the checks above."
+            )
 
 
 if __name__ == "__main__":
-    ray.init(runtime_env={"py_modules": benchmark_py_modules()})
     args = parse_args()
+    ray.init(
+        runtime_env={"py_modules": benchmark_py_modules()}, **ray_init_kwargs(args)
+    )
 
     # S3 sometimes returns transient ACCESS_DENIED on HeadObject under heavy
     # concurrent load (credential refresh or throttling). Retry these instead

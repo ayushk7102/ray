@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 import uuid
 from typing import Dict
@@ -16,8 +17,18 @@ from torchvision.models import ResNet50_Weights, resnet50
 
 import ray
 from ray.data import ActorPoolStrategy
+from lineage_reconstruction_chaos import (
+    add_chaos_args,
+    assert_lineage_reconstruction_ran,
+    install_lineage_reconstruction_counter,
+    ray_init_kwargs,
+    start_chaos,
+    stop_chaos,
+)
 
-WRITE_PATH = f"s3://ray-data-write-benchmark/{uuid.uuid4().hex}"
+WRITE_PATH = os.environ.get("RAY_DATA_WRITE_PATH") or (
+    f"s3://ray-data-write-benchmark/{uuid.uuid4().hex}"
+)
 
 
 def parse_args():
@@ -45,6 +56,15 @@ def parse_args():
         action="store_true",
         default=False,
     )
+    add_chaos_args(parser, min_alive_workers=6)
+    parser.add_argument(
+        "--verify-output",
+        action="store_true",
+        help=(
+            "Carry each row's source file and label to the sink and check that every "
+            "source row arrived exactly once (see verify_output.py)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -54,6 +74,10 @@ def main(args):
     smoke_test: bool = args.smoke_test
     chaos_test: bool = args.chaos_test
     data_url = f"s3://anonymous@air-example-data-2/{data_directory}"
+
+    reconstruction_state = None
+    if args.chaos and args.lineage_reconstruction:
+        reconstruction_state = install_lineage_reconstruction_counter()
 
     print(f"Running GPU batch prediction with data from {data_url}")
 
@@ -83,7 +107,12 @@ def main(args):
         # https://pytorch.org/vision/main/models/generated/torchvision.models.resnet50.html#torchvision.models.ResNet50_Weights  # noqa
         tensor_batch = tensor_batch.permute(0, 3, 1, 2)
         transformed_batch = transform(tensor_batch).numpy()
-        return {"image": transformed_batch}
+        output = {"image": transformed_batch}
+        # (path, label) is the row identity --verify-output checks.
+        for column in ("path", "label"):
+            if column in image_batch:
+                output[column] = image_batch[column]
+        return output
 
     class Predictor:
         def __init__(self, model):
@@ -94,7 +123,11 @@ def main(args):
         def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
             with torch.inference_mode():
                 output = self.model(torch.as_tensor(batch["image"], device=device))
-                return {"predictions": output.cpu().numpy()}
+                result = {"predictions": output.cpu().numpy()}
+                for column in ("path", "label"):
+                    if column in batch:
+                        result[column] = batch[column]
+                return result
 
     holder = {}
 
@@ -107,7 +140,7 @@ def main(args):
         elif data_format == "parquet":
             if smoke_test:
                 url += "/8cc8856e16c343829ef320fef4b353b1_000000.parquet"
-            ds = ray.data.read_parquet(url)
+            ds = ray.data.read_parquet(url, include_paths=args.verify_output)
 
         # Secondary timer that excludes the read_* metadata fetch.
         start_time_without_metadata_fetching = time.time()
@@ -126,8 +159,14 @@ def main(args):
         holder["total_time_s_wo_metadata_fetch"] = (
             time.time() - start_time_without_metadata_fetching
         )
+        if resource_killer is not None:
+            # Stopped inside `benchmark_fn` because `run_fn` queries every raylet
+            # for spill stats once this returns. That query fails on a node that
+            # was just killed but isn't marked dead yet.
+            stop_chaos(resource_killer)
 
     benchmark = Benchmark()
+    resource_killer = start_chaos(args) if args.chaos else None
     benchmark.run_fn("batch-inference", benchmark_fn)
 
     total_time = benchmark.result["batch-inference"][BenchmarkMetric.RUNTIME.value]
@@ -150,11 +189,35 @@ def main(args):
             "runtime_env_setup": RuntimeEnvSetupTracker.collect(),
         }
     )
+    if resource_killer is not None:
+        nodes_killed = ray.get(resource_killer.num_killed.remote())
+        print(f"Chaos killed {nodes_killed} worker raylets")
+        results["nodes_killed"] = nodes_killed
+    # Recorded before `write_result` so the count actually reaches result.json.
+    if reconstruction_state is not None:
+        results["lineage_reconstructions"] = reconstruction_state["reconstructions"]
     benchmark.result["batch-inference"].update(results)
     benchmark.write_result()
+
+    if reconstruction_state is not None:
+        # Asserted after `write_result` so the count is still reported on failure.
+        assert_lineage_reconstruction_ran(reconstruction_state)
+
+    if args.verify_output:
+        # Verified with pyarrow rather than Ray Data: checking Ray Data's output with
+        # Ray Data would let a bug cancel itself out.
+        from verify_output import verify
+
+        print(f"Verifying sink {WRITE_PATH}")
+        if verify(WRITE_PATH, data_directory) != 0:
+            raise RuntimeError(
+                f"Output verification failed for {WRITE_PATH}; see the checks above."
+            )
 
 
 if __name__ == "__main__":
     args = parse_args()
-    ray.init(runtime_env={"py_modules": benchmark_py_modules()})
+    ray.init(
+        runtime_env={"py_modules": benchmark_py_modules()}, **ray_init_kwargs(args)
+    )
     main(args)
